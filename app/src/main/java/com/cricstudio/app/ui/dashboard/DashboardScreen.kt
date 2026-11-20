@@ -193,17 +193,97 @@ fun DashboardScreen(
                 .background(MaterialTheme.colorScheme.background),
         ) {
             item(span = { GridItemSpan(maxLineSpan) }) {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text(
-                        text = stringResource(R.string.dashboard_headline),
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = MaterialTheme.colorScheme.onBackground,
-                    )
-                    Text(
-                        text = stringResource(R.string.dashboard_subtitle),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    val featured = uiState.matches.firstOrNull { it.state == MatchStateCode.IN || it.isDemo } ?: uiState.matches.firstOrNull()
+                    Surface(
+                        shape = RoundedCornerShape(18.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(
+                                    androidx.compose.ui.graphics.Brush.linearGradient(
+                                        listOf(
+                                            Color(0xFF0A1633),
+                                            Color(0xFF142A5E),
+                                            Color(0xFF0C2B1E),
+                                        ),
+                                    ),
+                                )
+                                .padding(18.dp),
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Surface(color = CricRed, shape = RoundedCornerShape(6.dp)) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                        ) {
+                                            LivePulseDot(color = Color.White, size = 6.dp)
+                                            Text("YOUTUBE RTMP READY", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                    Text(
+                                        text = "720p30 H.264 · Live Audio Mix",
+                                        color = Color(0xFFBFD4FF),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Medium,
+                                    )
+                                }
+                                Text(
+                                    text = stringResource(R.string.dashboard_headline),
+                                    fontFamily = BroadcastDisplayFamily,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 32.sp,
+                                    color = Color.White,
+                                )
+                                Text(
+                                    text = stringResource(R.string.dashboard_subtitle),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Color(0xFFD5E1F5),
+                                )
+                                if (featured != null) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "FEATURED BROADCAST",
+                                                color = Color(0xFF81C995),
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                            )
+                                            Text(
+                                                text = featured.name,
+                                                color = Color.White,
+                                                fontWeight = FontWeight.SemiBold,
+                                                fontSize = 14.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        Button(
+                                            onClick = { openCreateDialog(featured) },
+                                            shape = RoundedCornerShape(10.dp),
+                                            modifier = Modifier.testTag("hero_launch_studio_button"),
+                                        ) {
+                                            Icon(Icons.Rounded.Videocam, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Launch Studio")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     OutlinedTextField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },

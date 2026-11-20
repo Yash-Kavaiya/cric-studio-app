@@ -28,10 +28,15 @@ import com.cricstudio.app.model.OverlayId
 import com.cricstudio.app.model.SavedStudio
 import com.cricstudio.app.model.SceneGroup
 import com.cricstudio.app.model.SceneId
+import com.cricstudio.app.model.BroadcastStatus
+import com.cricstudio.app.model.CompositorSnapshot
 import com.cricstudio.app.model.StreamDestination
 import com.cricstudio.app.model.StreamPlatform
+import com.cricstudio.app.model.StreamQuality
+import com.cricstudio.app.model.StreamTelemetry
 import com.cricstudio.app.model.StudioState
 import com.cricstudio.app.model.Suggestion
+import com.cricstudio.app.streaming.BroadcastController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -51,6 +56,7 @@ data class AppUiState(
     val matchesError: String? = null,
     val savedStudios: List<SavedStudio> = emptyList(),
     val studio: StudioState? = null,
+    val sceneChangedAt: Long = System.currentTimeMillis(),
     val matchDetail: MatchDetail? = null,
     val loadingMatchDetail: Boolean = false,
     val demoAutoPlay: Boolean = true,
@@ -59,6 +65,7 @@ data class AppUiState(
     val commentary: CommentaryLine? = null,
     val commentaryHistory: List<CommentaryLine> = emptyList(),
     val destinations: List<StreamDestination> = emptyList(),
+    val streamTelemetry: StreamTelemetry = StreamTelemetry(),
     val chatMessages: List<ChatMessage> = emptyList(),
     val toast: String? = null,
 )
@@ -95,6 +102,40 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
             refreshMatches()
             startMatchesPolling()
         }
+        viewModelScope.launch {
+            BroadcastController.telemetry(application).collect { tel ->
+                val isBroadcasting = tel.status == BroadcastStatus.LIVE ||
+                    tel.status == BroadcastStatus.CONNECTING ||
+                    tel.status == BroadcastStatus.RECONNECTING
+                _uiState.update { st ->
+                    st.copy(
+                        streamTelemetry = tel,
+                        studio = st.studio?.copy(
+                            isLive = isBroadcasting,
+                            liveStartedAt = if (isBroadcasting) st.studio.liveStartedAt ?: System.currentTimeMillis() else null,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun pushCompositorSnapshot() {
+        val st = _uiState.value
+        val studio = st.studio ?: return
+        BroadcastController.updateSnapshot(
+            getApplication(),
+            CompositorSnapshot(
+                studio = studio,
+                match = st.matchDetail,
+                allMatches = st.matches,
+                commentary = st.commentary,
+                sceneChangedAt = st.sceneChangedAt,
+                isStreaming = st.streamTelemetry.status == BroadcastStatus.LIVE,
+                elapsedSeconds = st.streamTelemetry.elapsedSeconds,
+                micLevel = st.streamTelemetry.micLevel,
+            ),
+        )
     }
 
     fun toggleTheme() {
@@ -195,10 +236,12 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
         }
         attachMatch(saved.matchKey)
         startStudioTicker()
+        pushCompositorSnapshot()
     }
 
     fun leaveStudio() {
         closeStudioLoops()
+        BroadcastController.stopBroadcast(getApplication())
         commentator.stopVoice()
         _uiState.update { it.copy(studio = null, matchDetail = null) }
     }
@@ -344,8 +387,15 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         if (updated != st) {
-            _uiState.update { it.copy(studio = updated) }
+            val sceneChanged = updated.scene != st.scene
+            _uiState.update {
+                it.copy(
+                    studio = updated,
+                    sceneChangedAt = if (sceneChanged) now else it.sceneChangedAt,
+                )
+            }
         }
+        pushCompositorSnapshot()
     }
 
     private fun pickNextAutopilotScene(st: StudioState, match: MatchDetail?): SceneId? {
@@ -383,20 +433,27 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
     private fun emitChatter(st: StudioState, match: MatchDetail?) {
         val line = commentator.chatterLine(match, st.brand.pollQuestion)
         lastChatterMs = System.currentTimeMillis()
-        commentator.speakIfEnabled(line.text, st.autopilot.speakTts)
+        val streaming = _uiState.value.streamTelemetry.status == BroadcastStatus.LIVE
+        commentator.speakIfEnabled(line.text, st.autopilot.speakTts, mixIntoStream = streaming && st.autopilot.speakTts)
         _uiState.update {
             it.copy(
                 commentary = line,
                 commentaryHistory = (listOf(line) + it.commentaryHistory).take(20),
             )
         }
+        pushCompositorSnapshot()
     }
 
     fun setScene(scene: SceneId) {
-        lastSceneChangeMs = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        lastSceneChangeMs = now
         _uiState.update { st ->
-            st.copy(studio = st.studio?.copy(scene = scene, baseScene = scene, sceneUntil = null))
+            st.copy(
+                studio = st.studio?.copy(scene = scene, baseScene = scene, sceneUntil = null),
+                sceneChangedAt = now,
+            )
         }
+        pushCompositorSnapshot()
     }
 
     fun setAutomationMode(mode: AutomationMode) {
@@ -405,7 +462,8 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updateRules(transform: (AutomationRules) -> AutomationRules) {
         _uiState.update { st ->
-            st.copy(studio = st.studio?.copy(rules = transform(st.studio.rules)))
+            val current = st.studio ?: return@update st
+            st.copy(studio = current.copy(rules = transform(current.rules)))
         }
     }
 
@@ -416,12 +474,15 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
             if (!next.speakTts) commentator.stopVoice()
             st.copy(studio = current.copy(autopilot = next))
         }
+        pushCompositorSnapshot()
     }
 
     fun updateBranding(transform: (Branding) -> Branding) {
         _uiState.update { st ->
-            st.copy(studio = st.studio?.copy(brand = transform(st.studio.brand)))
+            val current = st.studio ?: return@update st
+            st.copy(studio = current.copy(brand = transform(current.brand)))
         }
+        pushCompositorSnapshot()
     }
 
     fun toggleBanner(kind: BannerKind) {
@@ -430,6 +491,7 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
             val next = if (current.banner?.kind == kind) null else ActiveBanner(kind)
             st.copy(studio = current.copy(banner = next))
         }
+        pushCompositorSnapshot()
     }
 
     fun showCustomOverlay(title: String, subtitle: String?, durationMs: Long = 8000L) {
@@ -444,30 +506,40 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
             priority = 3,
         )
         _uiState.update { st -> st.copy(studio = st.studio?.copy(overlay = ov)) }
+        pushCompositorSnapshot()
     }
 
     fun clearOverlay() {
         _uiState.update { st -> st.copy(studio = st.studio?.copy(overlay = null)) }
+        pushCompositorSnapshot()
     }
 
     fun setCountdownMinutes(minutes: Int?) {
-        val target = minutes?.let { System.currentTimeMillis() + it * 60_000L }
+        val now = System.currentTimeMillis()
+        val target = minutes?.let { now + it * 60_000L }
         _uiState.update { st ->
             val nextScene = if (target != null) SceneId.STARTING_SOON else st.studio?.scene ?: SceneId.SCORE_HERO
-            st.copy(studio = st.studio?.copy(countdownTo = target, scene = nextScene, baseScene = nextScene))
+            st.copy(
+                studio = st.studio?.copy(countdownTo = target, scene = nextScene, baseScene = nextScene),
+                sceneChangedAt = now,
+            )
         }
+        pushCompositorSnapshot()
     }
 
     fun showAnnouncement(title: String, text: String) {
+        val now = System.currentTimeMillis()
         _uiState.update { st ->
             st.copy(
                 studio = st.studio?.copy(
                     announcement = Announcement(title.trim(), text.trim()),
                     scene = SceneId.MESSAGE,
                     baseScene = SceneId.MESSAGE,
-                )
+                ),
+                sceneChangedAt = now,
             )
         }
+        pushCompositorSnapshot()
     }
 
     fun toggleParticipantStage(id: String) {
@@ -478,6 +550,7 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
             }
             st.copy(studio = current.copy(participants = list))
         }
+        pushCompositorSnapshot()
     }
 
     fun toggleParticipantMute(id: String) {
@@ -488,6 +561,7 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
             }
             st.copy(studio = current.copy(participants = list))
         }
+        pushCompositorSnapshot()
     }
 
     fun sayCustomLine(text: String) {
@@ -496,13 +570,15 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
         val st = _uiState.value.studio ?: return
         val line = CommentaryLine(id = "manual-${System.currentTimeMillis()}", text = trimmed, priority = 5)
         lastChatterMs = System.currentTimeMillis()
-        commentator.speakIfEnabled(trimmed, st.autopilot.speakTts)
+        val streaming = _uiState.value.streamTelemetry.status == BroadcastStatus.LIVE
+        commentator.speakIfEnabled(trimmed, st.autopilot.speakTts, mixIntoStream = streaming)
         _uiState.update {
             it.copy(
                 commentary = line,
                 commentaryHistory = (listOf(line) + it.commentaryHistory).take(20),
             )
         }
+        pushCompositorSnapshot()
     }
 
     fun simulateEvent(type: CricketEventType) {
@@ -631,32 +707,49 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
         }
         val line = commentator.lineForEvent(ev, _uiState.value.matchDetail)
         if (line != null && st.autopilot.commentator) {
-            commentator.speakIfEnabled(line.text, st.autopilot.speakTts)
+            val streaming = _uiState.value.streamTelemetry.status == BroadcastStatus.LIVE
+            commentator.speakIfEnabled(line.text, st.autopilot.speakTts, mixIntoStream = streaming && st.autopilot.speakTts)
         }
+        val sceneChanged = next.scene != st.scene
         _uiState.update {
             it.copy(
                 studio = next,
+                sceneChangedAt = if (sceneChanged) now else it.sceneChangedAt,
                 events = (listOf(ev) + it.events).take(30),
                 commentary = line ?: it.commentary,
                 commentaryHistory = if (line != null) (listOf(line) + it.commentaryHistory).take(20) else it.commentaryHistory,
             )
         }
+        pushCompositorSnapshot()
     }
 
     fun addDestination(platform: StreamPlatform, name: String, url: String, rawKey: String) {
         val studioId = _uiState.value.studio?.id ?: return
-        val masked = if (rawKey.length <= 4) "••••" else "••••${rawKey.takeLast(4)}"
+        val cleanKey = rawKey.trim()
+        val masked = if (cleanKey.length <= 4) "••••" else "••••${cleanKey.takeLast(4)}"
         val dest = StreamDestination(
             id = UUID.randomUUID().toString().take(8),
             platform = platform,
             name = name.trim().ifEmpty { platform.label },
-            url = url.trim(),
+            url = url.trim().ifEmpty { platform.presetUrl },
             keyMasked = masked,
+            streamKey = cleanKey,
             enabled = true,
         )
         val updated = _uiState.value.destinations + dest
         storage.saveDestinations(studioId, updated)
-        _uiState.update { it.copy(destinations = updated) }
+        _uiState.update { it.copy(destinations = updated, toast = "${dest.name} saved and ready to stream") }
+    }
+
+    fun updateDestinationKey(destId: String, newUrl: String, newRawKey: String) {
+        val studioId = _uiState.value.studio?.id ?: return
+        val cleanKey = newRawKey.trim()
+        val masked = if (cleanKey.length <= 4) "••••" else "••••${cleanKey.takeLast(4)}"
+        val updated = _uiState.value.destinations.map {
+            if (it.id == destId) it.copy(url = newUrl.trim(), streamKey = cleanKey, keyMasked = masked, enabled = true) else it
+        }
+        storage.saveDestinations(studioId, updated)
+        _uiState.update { it.copy(destinations = updated, toast = "Stream key updated") }
     }
 
     fun toggleDestination(destId: String) {
@@ -675,21 +768,64 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
         _uiState.update { it.copy(destinations = updated) }
     }
 
-    fun startBroadcast() {
-        val now = System.currentTimeMillis()
+    fun hasReadyDestination(): Boolean {
+        return _uiState.value.destinations.any { it.enabled && it.url.isNotBlank() && it.streamKey.isNotBlank() }
+    }
+
+    fun setStreamQuality(quality: StreamQuality) {
+        _uiState.update { it.copy(streamTelemetry = it.streamTelemetry.copy(quality = quality)) }
+    }
+
+    fun toggleMic() {
+        val next = !_uiState.value.streamTelemetry.micEnabled
+        BroadcastController.setMicEnabled(next)
+        _uiState.update { it.copy(streamTelemetry = it.streamTelemetry.copy(micEnabled = next)) }
+    }
+
+    fun saveDestinationAndGoLive(
+        platform: StreamPlatform,
+        name: String,
+        url: String,
+        rawKey: String,
+        quality: StreamQuality,
+        hasMicPermission: Boolean,
+        micEnabled: Boolean,
+    ) {
+        addDestination(platform, name, url, rawKey)
+        setStreamQuality(quality)
+        _uiState.update { it.copy(streamTelemetry = it.streamTelemetry.copy(micEnabled = micEnabled)) }
+        startBroadcast(hasMicPermission = hasMicPermission, micEnabledOverride = micEnabled)
+    }
+
+    fun startBroadcast(hasMicPermission: Boolean = false, micEnabledOverride: Boolean? = null) {
+        val ready = _uiState.value.destinations.filter { it.enabled && it.url.isNotBlank() && it.streamKey.isNotBlank() }
+        if (ready.isEmpty()) {
+            _uiState.update {
+                it.copy(toast = "Enter your YouTube stream key first to go live.")
+            }
+            return
+        }
+        pushCompositorSnapshot()
+        val tel = _uiState.value.streamTelemetry
+        val micOn = micEnabledOverride ?: tel.micEnabled
+        BroadcastController.startBroadcast(
+            context = getApplication(),
+            destinations = ready,
+            quality = tel.quality,
+            hasMicPermission = hasMicPermission,
+            micEnabled = micOn,
+        )
         _uiState.update {
-            it.copy(
-                studio = it.studio?.copy(isLive = true, liveStartedAt = now),
-                toast = "Broadcast preview ON AIR (local studio mode — RTMP relay requires server encoder)",
-            )
+            it.copy(toast = "Connecting to ${ready.joinToString(", ") { d -> d.name }}...")
         }
     }
 
     fun endBroadcast() {
+        BroadcastController.stopBroadcast(getApplication())
         _uiState.update {
             it.copy(
                 studio = it.studio?.copy(isLive = false, liveStartedAt = null),
-                toast = "Broadcast ended",
+                toast = "Live broadcast ended",
             )
         }
     }
@@ -709,6 +845,7 @@ class CricStudioViewModel(application: Application) : AndroidViewModel(applicati
     override fun onCleared() {
         super.onCleared()
         closeStudioLoops()
+        BroadcastController.stopBroadcast(getApplication())
         commentator.shutdown()
     }
 }

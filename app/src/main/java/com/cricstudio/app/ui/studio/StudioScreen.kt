@@ -1,6 +1,11 @@
 package com.cricstudio.app.ui.studio
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,6 +29,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Cast
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.LightMode
@@ -42,6 +48,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.ScrollableTabRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -56,10 +63,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
 import com.cricstudio.app.R
 import com.cricstudio.app.model.AutomationMode
 import com.cricstudio.app.model.AutomationRules
@@ -68,7 +79,9 @@ import com.cricstudio.app.model.BannerKind
 import com.cricstudio.app.model.Branding
 import com.cricstudio.app.model.CricketEventType
 import com.cricstudio.app.model.SceneId
+import com.cricstudio.app.model.StreamDestination
 import com.cricstudio.app.model.StreamPlatform
+import com.cricstudio.app.model.StreamQuality
 import com.cricstudio.app.model.StudioState
 import com.cricstudio.app.model.Suggestion
 import com.cricstudio.app.ui.AppUiState
@@ -87,10 +100,14 @@ private enum class ProducerTab(val label: String, val icon: ImageVector) {
 fun StudioScreen(
     uiState: AppUiState,
     studio: StudioState,
+    hasReadyDestination: () -> Boolean,
     onLeaveStudio: () -> Unit,
     onToggleTheme: () -> Unit,
-    onStartBroadcast: () -> Unit,
+    onStartBroadcast: (hasMicPermission: Boolean) -> Unit,
+    onSaveAndGoLive: (StreamPlatform, String, String, String, StreamQuality, Boolean, Boolean) -> Unit,
     onEndBroadcast: () -> Unit,
+    onToggleMic: () -> Unit,
+    onSelectQuality: (StreamQuality) -> Unit,
     onSelectScene: (SceneId) -> Unit,
     onSetAutomationMode: (AutomationMode) -> Unit,
     onUpdateRules: ((AutomationRules) -> AutomationRules) -> Unit,
@@ -111,16 +128,49 @@ fun StudioScreen(
     onToggleDemoAutoPlay: () -> Unit,
     onStepDemo: (Int) -> Unit,
     onAddDestination: (StreamPlatform, String, String, String) -> Unit,
+    onUpdateDestinationKey: (String, String, String) -> Unit,
     onToggleDestination: (String) -> Unit,
     onDeleteDestination: (String) -> Unit,
     onSendChat: (String) -> Unit,
 ) {
     BackHandler(onBack = onLeaveStudio)
 
+    val context = LocalContext.current
     var selectedTab by remember { mutableStateOf(ProducerTab.SCENES) }
     var showAnnouncementDialog by remember { mutableStateOf(false) }
     var showCustomOverlayDialog by remember { mutableStateOf(false) }
     var showAddDestDialog by remember { mutableStateOf(false) }
+    var editingDest by remember { mutableStateOf<StreamDestination?>(null) }
+    var showQuickGoLiveDialog by remember { mutableStateOf(false) }
+    var showFullscreenMonitor by remember { mutableStateOf(false) }
+
+    // Pending action after runtime RECORD_AUDIO / POST_NOTIFICATIONS permission flow
+    var pendingGoLiveAction by remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
+
+    val permLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) { result ->
+        val micGranted = result[Manifest.permission.RECORD_AUDIO] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        pendingGoLiveAction?.invoke(micGranted)
+        pendingGoLiveAction = null
+    }
+
+    fun launchWithPermissions(action: (Boolean) -> Unit) {
+        val micGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val needed = mutableListOf<String>()
+        if (!micGranted) needed.add(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val notifGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            if (!notifGranted) needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (needed.isEmpty()) {
+            action(true)
+        } else {
+            pendingGoLiveAction = action
+            permLauncher.launch(needed.toTypedArray())
+        }
+    }
 
     Scaffold(
         contentWindowInsets = WindowInsets.safeDrawing,
@@ -164,7 +214,15 @@ fun StudioScreen(
                         )
                     }
                     Button(
-                        onClick = { if (studio.isLive) onEndBroadcast() else onStartBroadcast() },
+                        onClick = {
+                            if (studio.isLive) {
+                                onEndBroadcast()
+                            } else if (hasReadyDestination()) {
+                                launchWithPermissions { micOk -> onStartBroadcast(micOk) }
+                            } else {
+                                showQuickGoLiveDialog = true
+                            }
+                        },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (studio.isLive) CricRed else MaterialTheme.colorScheme.primary,
                             contentColor = Color.White,
@@ -194,6 +252,37 @@ fun StudioScreen(
                 .background(MaterialTheme.colorScheme.background),
         ) {
             val isWide = maxWidth >= 760.dp
+
+            val monitorColumn: @Composable (Modifier) -> Unit = { colModifier ->
+                Column(
+                    modifier = colModifier,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    BroadcastStageCanvas(
+                        studio = studio,
+                        match = uiState.matchDetail,
+                        allMatches = uiState.matches,
+                        commentary = uiState.commentary,
+                        sceneChangedAt = uiState.sceneChangedAt,
+                        telemetry = uiState.streamTelemetry,
+                        onClearOverlay = onClearOverlay,
+                        onExpandFullscreen = { showFullscreenMonitor = true },
+                    )
+                    StreamTelemetryStrip(
+                        telemetry = uiState.streamTelemetry,
+                        onToggleMic = onToggleMic,
+                        onRetryStream = { launchWithPermissions { micOk -> onStartBroadcast(micOk) } },
+                    )
+                    QuickDirectorDock(
+                        studio = studio,
+                        demoAutoPlay = uiState.demoAutoPlay,
+                        onSelectScene = onSelectScene,
+                        onSimulateEvent = onSimulateEvent,
+                        onToggleDemoAutoPlay = onToggleDemoAutoPlay,
+                        onStepDemo = onStepDemo,
+                    )
+                }
+            }
 
             val producerDeck: @Composable (Modifier) -> Unit = { deckModifier ->
                 Column(modifier = deckModifier) {
@@ -248,8 +337,10 @@ fun StudioScreen(
                             ProducerTab.STREAM -> StreamAndChatTab(
                                 uiState = uiState,
                                 onAddDestinationClick = { showAddDestDialog = true },
+                                onEditDestinationClick = { editingDest = it },
                                 onToggleDestination = onToggleDestination,
                                 onDeleteDestination = onDeleteDestination,
+                                onSelectQuality = onSelectQuality,
                                 onSayCustomLine = onSayCustomLine,
                                 onSendChat = onSendChat,
                             )
@@ -260,21 +351,12 @@ fun StudioScreen(
 
             if (isWide) {
                 Row(modifier = Modifier.fillMaxSize()) {
-                    Column(
-                        modifier = Modifier
-                            .weight(1.1f)
+                    monitorColumn(
+                        Modifier
+                            .weight(1.15f)
                             .fillMaxHeight()
                             .padding(14.dp),
-                        verticalArrangement = Arrangement.Center,
-                    ) {
-                        BroadcastStageCanvas(
-                            studio = studio,
-                            match = uiState.matchDetail,
-                            allMatches = uiState.matches,
-                            commentary = uiState.commentary,
-                            onClearOverlay = onClearOverlay,
-                        )
-                    }
+                    )
                     producerDeck(
                         Modifier
                             .weight(1f)
@@ -283,19 +365,11 @@ fun StudioScreen(
                 }
             } else {
                 Column(modifier = Modifier.fillMaxSize()) {
-                    Box(
-                        modifier = Modifier
+                    monitorColumn(
+                        Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
-                    ) {
-                        BroadcastStageCanvas(
-                            studio = studio,
-                            match = uiState.matchDetail,
-                            allMatches = uiState.matches,
-                            commentary = uiState.commentary,
-                            onClearOverlay = onClearOverlay,
-                        )
-                    }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                    )
                     producerDeck(
                         Modifier
                             .weight(1f)
@@ -304,6 +378,137 @@ fun StudioScreen(
                 }
             }
         }
+    }
+
+    // Full-screen Broadcast Monitor Dialog
+    if (showFullscreenMonitor) {
+        Dialog(
+            onDismissRequest = { showFullscreenMonitor = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+                    .padding(12.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                BroadcastStageCanvas(
+                    studio = studio,
+                    match = uiState.matchDetail,
+                    allMatches = uiState.matches,
+                    commentary = uiState.commentary,
+                    sceneChangedAt = uiState.sceneChangedAt,
+                    telemetry = uiState.streamTelemetry,
+                    onClearOverlay = onClearOverlay,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                IconButton(
+                    onClick = { showFullscreenMonitor = false },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp),
+                ) {
+                    Icon(Icons.Rounded.Close, contentDescription = "Close full-screen monitor", tint = Color.White)
+                }
+            }
+        }
+    }
+
+    // One-Tap Quick YouTube Go Live Dialog
+    if (showQuickGoLiveDialog) {
+        var platform by remember { mutableStateOf(StreamPlatform.YOUTUBE) }
+        var url by remember { mutableStateOf(StreamPlatform.YOUTUBE.presetUrl) }
+        var streamKey by remember { mutableStateOf("") }
+        var quality by remember { mutableStateOf(uiState.streamTelemetry.quality) }
+        var micOn by remember { mutableStateOf(true) }
+
+        AlertDialog(
+            onDismissRequest = { showQuickGoLiveDialog = false },
+            title = { Text(stringResource(R.string.quick_go_live_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(StreamPlatform.entries) { p ->
+                            FilterChip(
+                                selected = platform == p,
+                                onClick = {
+                                    platform = p
+                                    url = p.presetUrl
+                                },
+                                label = { Text(p.label) },
+                            )
+                        }
+                    }
+                    Text(platform.helpText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    OutlinedTextField(
+                        value = url,
+                        onValueChange = { url = it },
+                        label = { Text("RTMP Server URL") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = streamKey,
+                        onValueChange = { streamKey = it },
+                        label = { Text("YouTube / RTMP Stream Key") },
+                        placeholder = { Text("xxxx-xxxx-xxxx-xxxx-xxxx") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("quick_stream_key_input"),
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StreamQuality.entries.forEach { q ->
+                            FilterChip(
+                                selected = quality == q,
+                                onClick = { quality = q },
+                                label = { Text(q.label) },
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text("Include Microphone Audio", style = MaterialTheme.typography.bodyMedium)
+                        Switch(checked = micOn, onCheckedChange = { micOn = it })
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showQuickGoLiveDialog = false
+                        val chosenPlatform = platform
+                        val chosenUrl = url
+                        val chosenKey = streamKey
+                        val chosenQ = quality
+                        val chosenMic = micOn
+                        launchWithPermissions { micGranted ->
+                            onSaveAndGoLive(
+                                chosenPlatform,
+                                chosenPlatform.label,
+                                chosenUrl,
+                                chosenKey,
+                                chosenQ,
+                                micGranted,
+                                chosenMic,
+                            )
+                        }
+                    },
+                    enabled = url.isNotBlank() && streamKey.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(containerColor = CricRed, contentColor = Color.White),
+                    modifier = Modifier.testTag("confirm_start_broadcast_button"),
+                ) {
+                    Text(stringResource(R.string.start_broadcast))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showQuickGoLiveDialog = false }) { Text("Cancel") }
+            },
+        )
     }
 
     if (showAnnouncementDialog) {
@@ -395,6 +600,31 @@ fun StudioScreen(
                 ) { Text("Save") }
             },
             dismissButton = { TextButton(onClick = { showAddDestDialog = false }) { Text("Cancel") } },
+        )
+    }
+
+    editingDest?.let { dest ->
+        var urlDraft by remember(dest.id) { mutableStateOf(dest.url) }
+        var keyDraft by remember(dest.id) { mutableStateOf(dest.streamKey) }
+        AlertDialog(
+            onDismissRequest = { editingDest = null },
+            title = { Text("Update ${dest.name} Stream Key") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(value = urlDraft, onValueChange = { urlDraft = it }, label = { Text("RTMP URL") }, singleLine = true)
+                    OutlinedTextField(value = keyDraft, onValueChange = { keyDraft = it }, label = { Text("Stream Key") }, singleLine = true)
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onUpdateDestinationKey(dest.id, urlDraft, keyDraft)
+                        editingDest = null
+                    },
+                    enabled = urlDraft.isNotBlank() && keyDraft.isNotBlank(),
+                ) { Text("Update") }
+            },
+            dismissButton = { TextButton(onClick = { editingDest = null }) { Text("Cancel") } },
         )
     }
 }

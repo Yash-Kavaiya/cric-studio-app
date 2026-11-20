@@ -723,32 +723,35 @@ fun BrandAndStageTab(
 fun StreamAndChatTab(
     uiState: AppUiState,
     onAddDestinationClick: () -> Unit,
+    onEditDestinationClick: (com.cricstudio.app.model.StreamDestination) -> Unit,
     onToggleDestination: (String) -> Unit,
     onDeleteDestination: (String) -> Unit,
+    onSelectQuality: (com.cricstudio.app.model.StreamQuality) -> Unit,
     onSayCustomLine: (String) -> Unit,
     onSendChat: (String) -> Unit,
 ) {
     var commentaryDraft by remember { mutableStateOf("") }
     var chatDraft by remember { mutableStateOf("") }
+    val telemetry = uiState.streamTelemetry
 
     LazyColumn(
         contentPadding = PaddingValues(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        // RTMP destinations
+        // Stream quality & RTMP destinations
         item {
             Card(
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
             ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("Stream Destinations", style = MaterialTheme.typography.titleMedium)
+                        Text("YouTube & RTMP Destinations", style = MaterialTheme.typography.titleMedium)
                         OutlinedButton(
                             onClick = onAddDestinationClick,
                             modifier = Modifier.testTag("add_destination_button"),
@@ -758,37 +761,130 @@ fun StreamAndChatTab(
                             Text("Add")
                         }
                     }
+
+                    // Encoding Quality Selector
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        com.cricstudio.app.model.StreamQuality.entries.forEach { q ->
+                            FilterChip(
+                                selected = telemetry.quality == q,
+                                onClick = { onSelectQuality(q) },
+                                label = { Text(q.label, fontSize = 11.sp) },
+                                modifier = Modifier.testTag("quality_${q.name.lowercase()}"),
+                            )
+                        }
+                    }
+
                     if (uiState.destinations.isEmpty()) {
-                        Text(
-                            "Add YouTube, Twitch, Facebook, X, or Custom RTMP destinations.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(10.dp),
+                        ) {
+                            Text(
+                                "Tap Add (or Go Live) to paste your YouTube Live Stream Key and push real 720p30 H.264 + AAC video straight from this device.",
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.padding(10.dp),
+                            )
+                        }
                     } else {
                         uiState.destinations.forEach { d ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            val liveInfo = telemetry.destinationStatuses[d.id]
+                            val missingKey = d.streamKey.isBlank()
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                shape = RoundedCornerShape(10.dp),
                             ) {
-                                Box(
+                                Column(
                                     modifier = Modifier
-                                        .size(10.dp)
-                                        .clip(CircleShape)
-                                        .background(Color(d.platform.colorHex)),
+                                        .fillMaxWidth()
+                                        .padding(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(10.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(d.platform.colorHex)),
+                                        )
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(d.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                                            Text(
+                                                "${d.platform.label} · ${if (missingKey) "Key missing — tap Edit" else d.keyMasked}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = if (missingKey) CricRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        TextButton(onClick = { onEditDestinationClick(d) }) {
+                                            Text("Edit Key")
+                                        }
+                                        Switch(checked = d.enabled, onCheckedChange = { onToggleDestination(d.id) })
+                                        IconButton(onClick = { onDeleteDestination(d.id) }) {
+                                            Icon(Icons.Rounded.Delete, contentDescription = "Delete destination", tint = CricRed)
+                                        }
+                                    }
+                                    if (liveInfo != null && liveInfo.status != com.cricstudio.app.model.BroadcastStatus.IDLE) {
+                                        val tint = when (liveInfo.status) {
+                                            com.cricstudio.app.model.BroadcastStatus.LIVE -> CricGreen
+                                            com.cricstudio.app.model.BroadcastStatus.ERROR -> CricRed
+                                            else -> CricYellow
+                                        }
+                                        Text(
+                                            text = "${liveInfo.status.label}: ${liveInfo.message}" +
+                                                if (liveInfo.bitrateKbps > 0) " (${liveInfo.bitrateKbps} kbps)" else "",
+                                            color = tint,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    telemetry.lastError?.let { err ->
+                        Surface(
+                            color = CricRed.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, CricRed.copy(alpha = 0.45f)),
+                        ) {
+                            Text(
+                                text = err,
+                                color = CricRed,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                            )
+                        }
+                    }
+
+                    if (telemetry.logs.isNotEmpty()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.background)
+                                .padding(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                "RTMP Connection Log",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            telemetry.logs.take(6).forEach { logLine ->
+                                Text(
+                                    text = logLine,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(d.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                                    Text(
-                                        "${d.platform.label} · ${d.keyMasked}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                                Switch(checked = d.enabled, onCheckedChange = { onToggleDestination(d.id) })
-                                IconButton(onClick = { onDeleteDestination(d.id) }) {
-                                    Icon(Icons.Rounded.Delete, contentDescription = "Delete destination", tint = CricRed)
-                                }
                             }
                         }
                     }
@@ -806,13 +902,13 @@ fun StreamAndChatTab(
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Icon(Icons.Rounded.RecordVoiceOver, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Text("Live Commentary Cue", style = MaterialTheme.typography.titleMedium)
+                        Text("Live Commentary Cue (Caption + Stream Audio)", style = MaterialTheme.typography.titleMedium)
                     }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(
                             value = commentaryDraft,
                             onValueChange = { commentaryDraft = it },
-                            placeholder = { Text("Type a line to caption / speak on air...") },
+                            placeholder = { Text("Type a line to caption & speak on air...") },
                             singleLine = true,
                             modifier = Modifier.weight(1f),
                         )

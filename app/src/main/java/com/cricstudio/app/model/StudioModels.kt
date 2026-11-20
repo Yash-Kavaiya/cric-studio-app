@@ -239,7 +239,60 @@ data class StreamDestination(
     val name: String,
     val url: String,
     val keyMasked: String,
+    val streamKey: String = "",
     val enabled: Boolean = true,
+)
+
+enum class StreamQuality(
+    val width: Int,
+    val height: Int,
+    val videoBitrateBps: Int,
+    val fps: Int,
+    val label: String,
+) {
+    HD_720P(1280, 720, 3_000_000, 30, "720p30 · 3.0 Mbps"),
+    SD_480P(854, 480, 1_500_000, 30, "480p30 · 1.5 Mbps"),
+}
+
+enum class BroadcastStatus(val label: String) {
+    IDLE("PREVIEW"),
+    CONNECTING("CONNECTING"),
+    LIVE("ON AIR"),
+    RECONNECTING("RECONNECTING"),
+    ERROR("STREAM ERROR"),
+}
+
+data class DestinationStatus(
+    val destinationId: String,
+    val name: String,
+    val status: BroadcastStatus = BroadcastStatus.IDLE,
+    val message: String = "Ready",
+    val bitrateKbps: Int = 0,
+)
+
+data class StreamTelemetry(
+    val status: BroadcastStatus = BroadcastStatus.IDLE,
+    val bitrateKbps: Int = 0,
+    val fps: Int = 0,
+    val droppedFrames: Int = 0,
+    val elapsedSeconds: Long = 0L,
+    val micEnabled: Boolean = true,
+    val micLevel: Float = 0f,
+    val quality: StreamQuality = StreamQuality.HD_720P,
+    val destinationStatuses: Map<String, DestinationStatus> = emptyMap(),
+    val lastError: String? = null,
+    val logs: List<String> = emptyList(),
+)
+
+data class CompositorSnapshot(
+    val studio: StudioState,
+    val match: MatchDetail?,
+    val allMatches: List<MatchListItem>,
+    val commentary: CommentaryLine?,
+    val sceneChangedAt: Long = System.currentTimeMillis(),
+    val isStreaming: Boolean = false,
+    val elapsedSeconds: Long = 0L,
+    val micLevel: Float = 0f,
 )
 
 @Serializable

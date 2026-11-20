@@ -1,38 +1,71 @@
 package com.cricstudio.app.engine
 
 import android.content.Context
+import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import com.cricstudio.app.model.CommentaryLine
 import com.cricstudio.app.model.CricketEvent
 import com.cricstudio.app.model.CricketEventType
 import com.cricstudio.app.model.MatchDetail
 import com.cricstudio.app.model.MatchStateCode
+import com.cricstudio.app.streaming.BroadcastController
+import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
  * Context-aware cricket commentator ported from apps/server/src/commentary/commentator.ts,
- * paired with Android's on-device TextToSpeech when voice output is enabled.
+ * paired with Android's on-device TextToSpeech for local playback AND live RTMP PCM audio mixing.
  */
 class CommentatorEngine(context: Context) {
 
+    private val appContext = context.applicationContext
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var seq = 0
+    private val pendingWavFiles = ConcurrentHashMap<String, File>()
 
     init {
-        tts = TextToSpeech(context.applicationContext) { status ->
+        tts = TextToSpeech(appContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts?.language = Locale.UK
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) = Unit
+                    override fun onDone(utteranceId: String?) {
+                        val file = utteranceId?.let { pendingWavFiles.remove(it) } ?: return
+                        decodeWavToBroadcastMixer(file)
+                        runCatching { file.delete() }
+                    }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        utteranceId?.let { pendingWavFiles.remove(it)?.delete() }
+                    }
+                })
                 ttsReady = true
             }
         }
     }
 
-    fun speakIfEnabled(text: String, speakVoice: Boolean) {
-        if (speakVoice && ttsReady) {
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "cric_${++seq}")
+    fun speakIfEnabled(text: String, speakVoice: Boolean, mixIntoStream: Boolean = false) {
+        if (!ttsReady) return
+        val id = "cric_${++seq}"
+        if (mixIntoStream) {
+            val outFile = File(appContext.cacheDir, "$id.wav")
+            val synthId = "${id}_pcm"
+            pendingWavFiles[synthId] = outFile
+            runCatching {
+                tts?.synthesizeToFile(text, Bundle(), outFile, synthId)
+            }.onFailure {
+                pendingWavFiles.remove(synthId)
+            }
+        }
+        if (speakVoice) {
+            tts?.speak(text, TextToSpeech.QUEUE_ADD, null, id)
         }
     }
 
@@ -44,6 +77,57 @@ class CommentatorEngine(context: Context) {
         tts?.stop()
         tts?.shutdown()
         tts = null
+        pendingWavFiles.values.forEach { runCatching { it.delete() } }
+        pendingWavFiles.clear()
+    }
+
+    private fun decodeWavToBroadcastMixer(file: File) {
+        runCatching {
+            val bytes = file.readBytes()
+            if (bytes.size < 44) return
+            val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            // Parse WAV fmt & data chunks cleanly
+            var pos = 12
+            var sampleRate = 22050
+            var channels = 1
+            var bitsPerSample = 16
+            var dataOffset = -1
+            var dataSize = 0
+            while (pos + 8 <= bytes.size) {
+                val tag = String(bytes, pos, 4)
+                val size = bb.getInt(pos + 4)
+                val next = pos + 8 + size + (size and 1)
+                if (tag == "fmt " && pos + 24 <= bytes.size) {
+                    channels = bb.getShort(pos + 10).toInt().coerceAtLeast(1)
+                    sampleRate = bb.getInt(pos + 12).coerceAtLeast(8000)
+                    bitsPerSample = bb.getShort(pos + 22).toInt()
+                } else if (tag == "data") {
+                    dataOffset = pos + 8
+                    dataSize = size.coerceAtMost(bytes.size - dataOffset)
+                    break
+                }
+                if (next <= pos) break
+                pos = next
+            }
+            if (dataOffset < 0 || dataSize <= 0 || bitsPerSample != 16) return
+
+            val srcFrames = dataSize / (channels * 2)
+            if (srcFrames <= 0) return
+            val dstRate = 44100
+            val dstFrames = ((srcFrames.toLong() * dstRate) / sampleRate).toInt().coerceAtLeast(1)
+            val stereoOut = ShortArray(dstFrames * 2)
+            val ratio = srcFrames.toDouble() / dstFrames.toDouble()
+
+            for (i in 0 until dstFrames) {
+                val srcIdx = (i * ratio).toInt().coerceIn(0, srcFrames - 1)
+                val bytePos = dataOffset + srcIdx * channels * 2
+                val sL = bb.getShort(bytePos)
+                val sR = if (channels > 1 && bytePos + 2 < dataOffset + dataSize) bb.getShort(bytePos + 2) else sL
+                stereoOut[i * 2] = sL
+                stereoOut[i * 2 + 1] = sR
+            }
+            BroadcastController.enqueueTtsPcm(stereoOut)
+        }
     }
 
     fun lineForEvent(ev: CricketEvent, match: MatchDetail?): CommentaryLine? {

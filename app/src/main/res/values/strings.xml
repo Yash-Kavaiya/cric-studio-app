@@ -9,9 +9,12 @@
     <string name="your_studios">Your studios</string>
     <string name="no_matches_message">No matches in this view right now.</string>
     <string name="go_live">Go live</string>
-    <string name="end_broadcast">End broadcast</string>
+    <string name="end_broadcast">End live</string>
     <string name="auto_live_title">Auto Live mode</string>
     <string name="director_mode">Director mode</string>
     <string name="fire_a_moment">Fire a moment</string>
     <string name="live_event_feed">Live event feed</string>
+    <string name="quick_go_live_title">Go Live on YouTube</string>
+    <string name="start_broadcast">Start Broadcast</string>
+    <string name="stream_health_title">Live Stream Telemetry</string>
 </resources>
