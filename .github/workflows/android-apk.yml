@@ -31,11 +31,24 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # ubuntu-latest ships an Android SDK (incl. platform-tools). Install only
+      # what the build needs, with retries: sdkmanager downloads are flaky and
+      # a corrupted zip ("Error on ZipFile unknown archive") fails the job.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # Default installs the removed 'tools' package and fails.
-          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -n1)
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          for attempt in 1 2 3 4; do
+            if "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0"; then
+              exit 0
+            fi
+            echo "sdkmanager failed (attempt $attempt), retrying..."
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       # The repo has no Gradle wrapper, so pin the version used locally.
       - name: Set up Gradle
