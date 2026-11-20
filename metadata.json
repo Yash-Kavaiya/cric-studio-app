@@ -1,0 +1,6 @@
+{
+  "name": "CricStudio",
+  "description": "Live cricket broadcast studio with real ESPN scores, demo T20I replay, automated scenes, event celebrations, and live commentary",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,421 @@
+// Hardware program encoder: WebCodecs H.264 on the GPU (Intel Quick Sync / NVENC / AMF via Chrome)
+// + Opus audio, muxed to fragmented MP4 and streamed to the server, which passes the H.264 through.
+// Frames are encoded on a fixed 30 Hz clock. If a paint runs long, the previous picture is encoded
+// again so YouTube still receives 30 fps instead of whatever rate the compositor managed.
+import { Muxer, StreamTarget } from 'mp4-muxer';
+import { FRAME_US, OUTPUT_FPS, cfrPlan, frameTimestampUs } from './cfr';
+import { workerTicker } from './renderer';
+import type { RecorderSink } from './recorder';
+
+const W = 1920;
+const H = 1080;
+const FPS = OUTPUT_FPS;
+const KEYFRAME_FRAMES = FPS * 2; // platforms want a keyframe at least every 2–4 s
+const AVC_CODEC = 'avc1.640028'; // High profile, level 4.0 (1080p30)
+const MAX_VIDEO_QUEUE = 6; // frames waiting in the encoder before we start dropping
+/** catch-up duplicates after a hitch; longer stalls snap to now so latency stays bounded */
+const MAX_BURST = 8;
+
+type TrackProcessorCtor = new (o: { track: MediaStreamTrack; maxBufferSize?: number }) => {
+  readable: ReadableStream<VideoFrame | AudioData>;
+};
+const Processor = (globalThis as unknown as { MediaStreamTrackProcessor?: TrackProcessorCtor }).MediaStreamTrackProcessor;
+
+/** Chrome logs and then stalls if a VideoFrame or AudioData is garbage-collected without close(). */
+function closeSample(sample: VideoFrame | AudioData | undefined) {
+  if (!sample) return;
+  try {
+    sample.close();
+  } catch {
+    /* already closed */
+  }
+}
+
+let support: Promise<boolean> | null = null;
+
+/** True when this browser can encode 1080p30 H.264 on the GPU and read raw tracks. Cached. */
+export function hardwareEncodingSupported(): Promise<boolean> {
+  support ??= (async () => {
+    if (typeof VideoEncoder === 'undefined' || typeof AudioEncoder === 'undefined' || !Processor) return false;
+    try {
+      const v = await VideoEncoder.isConfigSupported(videoConfig(6_000_000));
+      if (!v.supported) return false;
+      const a = await AudioEncoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, bitrate: 160_000 });
+      return !!a.supported;
+    } catch {
+      return false;
+    }
+  })();
+  return support;
+}
+
+function videoConfig(bps: number): VideoEncoderConfig {
+  return {
+    codec: AVC_CODEC,
+    width: W,
+    height: H,
+    bitrate: bps,
+    framerate: FPS,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    avc: { format: 'avc' },
+  };
+}
+
+/** One encode session = one fMP4 stream with its own init segment. */
+class HwSession {
+  private stopped = false;
+  private venc: VideoEncoder | null = null;
+  private aenc: AudioEncoder | null = null;
+  private muxer: Muxer<StreamTarget> | null = null;
+  private readers: ReadableStreamDefaultReader<VideoFrame | AudioData>[] = [];
+  /** per-session clones: cancelling a track processor ends its track, so never hand it the shared ones */
+  private clones: MediaStreamTrack[] = [];
+  private readonly t0 = performance.now();
+  private videoOffset: number | null = 0; // frames are already stamped on the session clock
+  private audioOffset: number | null = null;
+  private lastKeyIndex = -KEYFRAME_FRAMES;
+  private forceKey = true;
+  private written = 0;
+  private lastAudioTs = -Infinity;
+  /** next CFR frame index to encode */
+  private frameIndex = 0;
+  /** first tick starts at "now" so the audio probe does not become a burst of past frames */
+  private clockArmed = false;
+  private stopClock: (() => void) | null = null;
+  /** moov is written on the second keyframe; the first two frames are keys so ffmpeg sees it immediately */
+  private keysSent = 0;
+  dropped = 0;
+  /** encoded video frames, for the live fps readout */
+  encoded = 0;
+
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly audio: MediaStreamTrack | null,
+    private readonly sink: RecorderSink,
+    private readonly videoBps: number,
+    private readonly onBytes: (n: number) => void,
+    private readonly onFail: (why: string) => void,
+  ) {}
+
+  private now() {
+    return Math.round((performance.now() - this.t0) * 1000);
+  }
+
+  private fail(why: string) {
+    if (this.stopped) return;
+    this.stop();
+    this.onFail(why);
+  }
+
+  async start() {
+    // Tell the server to drop the old stream before we block on the audio probe. Anything sent
+    // in between is a mid-fragment and would make ffmpeg reject the pipe.
+    this.sink.reset('video/mp4;codecs=avc1,opus');
+    if (this.stopped) return;
+    const audioFmt = this.audio ? await this.firstAudioFormat() : null;
+    if (this.stopped) {
+      this.releaseReaders();
+      return;
+    }
+    this.muxer = new Muxer({
+      target: new StreamTarget({
+        // fragmented MP4 is written strictly in order, so `position` only ever moves forward
+        onData: (data, position) => {
+          if (this.stopped) return;
+          if (position < this.written) return this.fail('muxer seeked backwards');
+          this.written = position + data.byteLength;
+          const copy = data.slice(); // the muxer reuses its buffer
+          this.onBytes(copy.byteLength);
+          this.sink.chunk(copy.buffer);
+        },
+      }),
+      // 30 Hz timescale. Timestamps are exact multiples of 1/30 s, so ticks do not collapse.
+      video: { codec: 'avc', width: W, height: H, frameRate: FPS },
+      audio: audioFmt ? { codec: 'opus', sampleRate: audioFmt.sampleRate, numberOfChannels: audioFmt.channels } : undefined,
+      fastStart: 'fragmented',
+      // default is 1s, and we only cut on keyframes (every 2s), so moov arrived too late for ffmpeg's probe
+      minFragmentDuration: 0,
+      firstTimestampBehavior: 'cross-track-offset',
+    });
+
+    const venc = new VideoEncoder({
+      output: (chunk, meta) => {
+        if (this.stopped || !this.muxer || this.videoOffset === null) return;
+        try {
+          this.muxer.addVideoChunk(chunk, meta, chunk.timestamp + this.videoOffset);
+          this.encoded++;
+        } catch (e) {
+          this.fail(`mux video: ${(e as Error).message}`);
+        }
+      },
+      error: (e) => this.fail(`video encoder: ${e.message}`),
+    });
+    venc.configure(videoConfig(this.videoBps));
+    this.venc = venc;
+
+    this.stopClock = workerTicker(FPS, () => this.emitDue());
+    if (audioFmt) {
+      const aenc = new AudioEncoder({
+        output: (chunk, meta) => {
+          if (this.stopped || !this.muxer || this.audioOffset === null) return;
+          try {
+            this.muxer.addAudioChunk(chunk, meta, chunk.timestamp + this.audioOffset);
+          } catch (e) {
+            this.fail(`mux audio: ${(e as Error).message}`);
+          }
+        },
+        error: (e) => this.fail(`audio encoder: ${e.message}`),
+      });
+      aenc.configure({ codec: 'opus', sampleRate: audioFmt.sampleRate, numberOfChannels: audioFmt.channels, bitrate: 160_000 });
+      this.aenc = aenc;
+      void this.pumpAudio(audioFmt.reader);
+    }
+  }
+
+  /** Snapshot the program canvas. A late paint repeats the pixels already there, at the next 30 Hz slot. */
+  private grab(index: number): VideoFrame | null {
+    if (this.canvas.width < 2 || this.canvas.height < 2) return null;
+    try {
+      return new VideoFrame(this.canvas, {
+        timestamp: frameTimestampUs(index),
+        duration: Math.round(FRAME_US),
+        alpha: 'discard',
+      });
+    } catch (e) {
+      if (!this.stopped) this.fail(`video input: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** Reads one AudioData to learn the real sample rate / channel count, then keeps reading from it. */
+  private async firstAudioFormat(): Promise<{ sampleRate: number; channels: number; reader: ReadableStreamDefaultReader<AudioData> } | null> {
+    const track = this.audio!.clone();
+    this.clones.push(track);
+    const reader = new Processor!({ track, maxBufferSize: 1 }).readable.getReader() as ReadableStreamDefaultReader<AudioData>;
+    this.readers.push(reader);
+    const pending = reader.read();
+    const first = await Promise.race([
+      pending.then((r) => r),
+      new Promise<null>((res) => setTimeout(() => res(null), 1500)),
+    ]);
+    if (!first || first.done || !first.value) {
+      // The read can resolve after the timeout. Close that sample; don't leave it for the GC.
+      void pending.then((r) => closeSample(r.value)).catch(() => undefined);
+      void reader.cancel().catch(() => undefined);
+      return null; // silent/absent track → video only
+    }
+    const d = first.value;
+    const fmt = { sampleRate: d.sampleRate, channels: Math.min(2, d.numberOfChannels) || 1, reader };
+    closeSample(d);
+    return fmt;
+  }
+
+  /** Encode every CFR slot that wall-clock time says is due. A slow paint repeats the current canvas. */
+  private emitDue() {
+    const venc = this.venc;
+    if (this.stopped || !venc || venc.state !== 'configured') return;
+    const elapsedUs = (performance.now() - this.t0) * 1000;
+    if (!this.clockArmed) {
+      this.clockArmed = true;
+      this.frameIndex = Math.max(0, Math.floor(elapsedUs / FRAME_US + 1e-6));
+    }
+    const plan = cfrPlan(elapsedUs, this.frameIndex, MAX_BURST);
+    if (plan.encode === 0) return;
+    if (plan.startIndex !== this.frameIndex) this.forceKey = true;
+    for (let i = 0; i < plan.encode; i++) {
+      if (this.stopped) break;
+      this.encodeAt(plan.startIndex + i);
+    }
+    this.frameIndex = plan.nextIndex;
+  }
+
+  private encodeAt(index: number) {
+    const venc = this.venc;
+    if (!venc || venc.state !== 'configured') return;
+    if (venc.encodeQueueSize > MAX_VIDEO_QUEUE) {
+      this.dropped++;
+      this.forceKey = true;
+      return;
+    }
+    const stamped = this.grab(index);
+    if (!stamped) {
+      this.dropped++;
+      this.forceKey = true;
+      return;
+    }
+    const key = this.forceKey || this.keysSent < 2 || index - this.lastKeyIndex >= KEYFRAME_FRAMES;
+    if (key) {
+      this.lastKeyIndex = index;
+      this.forceKey = false;
+      this.keysSent++;
+    }
+    try {
+      venc.encode(stamped, { keyFrame: key });
+    } catch (e) {
+      this.dropped++;
+      this.forceKey = true;
+      if (venc.state !== 'configured' && !this.stopped) this.fail(`video input: ${(e as Error).message}`);
+    } finally {
+      closeSample(stamped);
+    }
+  }
+
+  /** Read and close whatever the processor still has queued. Cancelling instead leaks those frames. */
+  private async drain(reader: ReadableStreamDefaultReader<VideoFrame | AudioData>) {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        closeSample(value);
+      }
+    } catch {
+      /* reader cancelled */
+    }
+  }
+
+  private async pumpAudio(reader: ReadableStreamDefaultReader<AudioData>) {
+    try {
+      while (!this.stopped) {
+        const { value: data, done } = await reader.read();
+        if (done || !data) break;
+        const aenc = this.aenc;
+        if (this.stopped || !aenc || aenc.state !== 'configured') {
+          closeSample(data);
+          await this.drain(reader);
+          break;
+        }
+        try {
+          if (data.timestamp <= this.lastAudioTs) continue;
+          this.lastAudioTs = data.timestamp;
+          if (this.audioOffset === null) this.audioOffset = this.now() - data.timestamp;
+          aenc.encode(data);
+        } catch (e) {
+          if (aenc.state !== 'configured' && !this.stopped) this.fail(`audio input: ${(e as Error).message}`);
+          if (aenc.state !== 'configured' || this.stopped) {
+            await this.drain(reader);
+            break;
+          }
+        } finally {
+          closeSample(data);
+        }
+      }
+    } catch (e) {
+      if (!this.stopped) this.fail(`audio input: ${(e as Error).message}`);
+    }
+  }
+
+  stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.stopClock?.();
+    this.stopClock = null;
+    for (const t of this.clones) t.stop();
+    this.clones = [];
+    const venc = this.venc;
+    const aenc = this.aenc;
+    this.venc = null;
+    this.aenc = null;
+    this.muxer = null; // the server restarts its encoder on the next init segment; no finalize needed
+    // Let the pump loops close frames already sitting in the readers, then cancel anything left.
+    const readers = this.readers;
+    this.readers = [];
+    setTimeout(() => this.releaseReaders(readers), 200);
+    void this.shutdownEncoders(venc, aenc);
+  }
+
+  private releaseReaders(readers = this.readers) {
+    for (const r of readers) void r.cancel().catch(() => undefined);
+  }
+
+  /** flush() releases frames the encoder still holds. close() without it is what Chrome warns about. */
+  private async shutdownEncoders(venc: VideoEncoder | null, aenc: AudioEncoder | null) {
+    for (const enc of [venc, aenc]) {
+      if (!enc || enc.state === 'closed') continue;
+      try {
+        if (enc.state === 'configured') {
+          await Promise.race([enc.flush(), new Promise((res) => setTimeout(res, 400))]);
+        }
+      } catch {
+        /* flush rejects once the encoder has already failed */
+      }
+      try {
+        enc.close();
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+}
+
+/** Same contract as ProgramRecorder (start / restart / stop), backed by the GPU encoder. */
+export class HwProgramRecorder {
+  private session: HwSession | null = null;
+  private readonly audio: MediaStreamTrack | null;
+  bytesSent = 0;
+
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    audio: MediaStream | null,
+    private readonly sink: RecorderSink,
+    private readonly onFail: (why: string) => void,
+    private readonly videoBps = 6_000_000,
+  ) {
+    this.audio = audio?.getAudioTracks()[0] ?? null;
+  }
+
+  get running() {
+    return !!this.session;
+  }
+
+  get dropped() {
+    return this.session?.dropped ?? 0;
+  }
+
+  private fpsMark = { t: performance.now(), n: 0 };
+  /** frames per second actually leaving the encoder (sampled since the last call) */
+  sampleFps(): number {
+    const now = performance.now();
+    const n = this.session?.encoded ?? 0;
+    const dt = now - this.fpsMark.t;
+    const fps = dt > 0 && n >= this.fpsMark.n ? ((n - this.fpsMark.n) * 1000) / dt : 0;
+    this.fpsMark = { t: now, n };
+    return fps;
+  }
+
+  start() {
+    this.session?.stop();
+    const s = new HwSession(
+      this.canvas,
+      this.audio,
+      this.sink,
+      this.videoBps,
+      (n) => (this.bytesSent += n),
+      (why) => {
+        if (this.session !== s) return;
+        this.session = null;
+        this.onFail(why);
+      },
+    );
+    this.session = s;
+    s.start().catch((e: Error) => {
+      if (this.session !== s) return;
+      s.stop();
+      this.session = null;
+      this.onFail(`start: ${e.message}`);
+    });
+  }
+
+  restart() {
+    this.start();
+  }
+
+  stop() {
+    this.session?.stop();
+    this.session = null;
+  }
+
+  dispose() {
+    this.stop();
+  }
+}

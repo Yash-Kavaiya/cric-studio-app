@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">CricStudio</string>
+    <string name="dashboard_headline">Go live with cricket</string>
+    <string name="dashboard_subtitle">Pick a match — live scores, ball-by-ball, scorecards and automated broadcast scenes are wired in for you.</string>
+    <string name="new_studio">New studio</string>
+    <string name="create_studio">Create studio</string>
+    <string name="enter_studio">Enter studio</string>
+    <string name="search_matches_hint">Search matches, series, teams</string>
+    <string name="your_studios">Your studios</string>
+    <string name="no_matches_message">No matches in this view right now.</string>
+    <string name="go_live">Go live</string>
+    <string name="end_broadcast">End broadcast</string>
+    <string name="auto_live_title">Auto Live mode</string>
+    <string name="director_mode">Director mode</string>
+    <string name="fire_a_moment">Fire a moment</string>
+    <string name="live_event_feed">Live event feed</string>
+</resources>

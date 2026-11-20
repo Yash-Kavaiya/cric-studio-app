@@ -1,0 +1,233 @@
+import { useEffect, useState } from 'react';
+import { Alert, Box, Button, Chip, Divider, FormControlLabel, InputAdornment, Slider, Stack, Switch, TextField, Typography } from '@mui/material';
+import type { AutopilotSettings } from '@cricstudio/shared';
+import type { StudioClient } from '../../lib/studioClient';
+import { Icon } from '../Icon';
+import { AiCommentarySettings } from './AiCommentarySettings';
+
+export function AutopilotPanel({ client, hostToken, onGoCloud, hasDestinations }: { client: StudioClient; hostToken: string; onGoCloud: () => void; hasDestinations: boolean }) {
+  const st = client.state!;
+  const ap = st.autopilot;
+  const [say, setSay] = useState('');
+  const patch = (p: Partial<AutopilotSettings>) => void client.patch({ autopilot: { ...ap, ...p } });
+  const live = st.live.state !== 'idle';
+  const cloudLive = live && st.live.broadcaster === 'cloud';
+
+  return (
+    <Stack spacing={2}>
+      <Box sx={{ p: 2, borderRadius: 2, bgcolor: ap.enabled ? 'primary.main' : 'action.hover', color: ap.enabled ? 'primary.contrastText' : 'text.primary', transition: 'all .3s' }}>
+        <Stack direction="row" alignItems="center" spacing={1.5}>
+          <Icon name="smart_toy" size={30} fill={ap.enabled} />
+          <Box sx={{ flex: 1 }}>
+            <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+              Auto Live mode
+            </Typography>
+            <Typography variant="caption" sx={{ opacity: 0.85 }}>
+              Runs the show without a host: rotating scenes, music, celebrations and an AI commentator.
+            </Typography>
+          </Box>
+          <Switch checked={ap.enabled} onChange={(e) => patch({ enabled: e.target.checked })} color="default" />
+        </Stack>
+      </Box>
+
+      <SceneDuration seconds={ap.sceneSeconds} onChange={(v) => patch({ sceneSeconds: v })} />
+
+      <Box>
+        <Typography variant="subtitle2">Score focus · {Math.round((ap.scoreShare ?? 0.7) * 100)}% score / {100 - Math.round((ap.scoreShare ?? 0.7) * 100)}% stats & insights</Typography>
+        <Slider
+          size="small"
+          min={0}
+          max={100}
+          step={5}
+          marks={[
+            { value: 50, label: '50%' },
+            { value: 70, label: '70%' },
+            { value: 90, label: '90%' },
+          ]}
+          defaultValue={Math.round((ap.scoreShare ?? 0.7) * 100)}
+          onChangeCommitted={(_, v) => patch({ scoreShare: (v as number) / 100 })}
+        />
+        <Typography variant="caption" color="text.secondary">
+          Share of cuts that go to Live Score, Ball by Ball, Batting Scorecard, Bowling Figures and (every third one) camera shots. The rest always rotate in turn through stats, insights, analysis and match scenes.
+        </Typography>
+      </Box>
+
+      <FormControlLabel
+        control={<Switch checked={ap.includeCameras} onChange={(e) => patch({ includeCameras: e.target.checked })} />}
+        label={
+          <Box>
+            <Typography variant="body2">Include host & guest camera scenes</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Off = 100% scoreboard show (no host camera). On = cameras join the rotation when someone is on stage.
+            </Typography>
+          </Box>
+        }
+        sx={{ alignItems: 'flex-start', mx: 0 }}
+      />
+      <FormControlLabel
+        control={<Switch checked={!!st.brand.camBubbles} onChange={(e) => void client.patch({ brand: { ...st.brand, camBubbles: e.target.checked } })} />}
+        label={
+          <Box>
+            <Typography variant="body2">Camera frames on all scenes</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Keeps the host and guests on screen over every scene. Shape, size and where they sit are in the Brand tab. Each guest can drag their own frame.
+            </Typography>
+          </Box>
+        }
+        sx={{ alignItems: 'flex-start', mx: 0 }}
+      />
+      <FormControlLabel
+        control={<Switch checked={ap.autoMusic} onChange={(e) => patch({ autoMusic: e.target.checked })} />}
+        label={
+          <Box>
+            <Typography variant="body2">Auto music bed</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Rotates royalty-free tracks every few minutes, ducks under commentary, plays victory music on the result.
+            </Typography>
+          </Box>
+        }
+        sx={{ alignItems: 'flex-start', mx: 0 }}
+      />
+      <FormControlLabel
+        control={<Switch checked={ap.autoMatch} onChange={(e) => patch({ autoMatch: e.target.checked })} />}
+        label={
+          <Box>
+            <Typography variant="body2">Auto-pick live matches (24/7)</Typography>
+            <Typography variant="caption" color="text.secondary">
+              Follows the best live match; when it ends, moves to the next one (replay if nothing is live).
+            </Typography>
+          </Box>
+        }
+        sx={{ alignItems: 'flex-start', mx: 0 }}
+      />
+
+      <Divider />
+      <Box>
+        <Stack direction="row" alignItems="center">
+          <Typography variant="subtitle2" sx={{ flex: 1 }}>
+            AI commentator
+          </Typography>
+          <Switch checked={ap.commentator} onChange={(e) => patch({ commentator: e.target.checked })} />
+        </Stack>
+        <Typography variant="caption" color="text.secondary">
+          Human-like neural voice reacts to every boundary, wicket and milestone, and chats about the chase, partnerships and other games between deliveries.
+        </Typography>
+        <AiCommentarySettings client={client} hostToken={hostToken} />
+        <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 1.5 }}>
+          Chatter every ~{ap.chatterSeconds}s when the game is quiet
+        </Typography>
+        <Slider size="small" min={15} max={120} step={5} defaultValue={ap.chatterSeconds} onChangeCommitted={(_, v) => patch({ chatterSeconds: v as number })} />
+        <Stack direction="row" spacing={1}>
+          <TextField fullWidth placeholder="Type a line for the commentator to say on air" value={say} onChange={(e) => setSay(e.target.value)} />
+          <Button
+            variant="contained"
+            disabled={!say.trim()}
+            onClick={() => {
+              void client.sayNow(say);
+              setSay('');
+            }}
+          >
+            Say
+          </Button>
+        </Stack>
+        {client.commentary && (
+          <Alert icon={<Icon name="record_voice_over" />} severity="info" sx={{ mt: 1 }}>
+            {client.commentary.text}
+          </Alert>
+        )}
+      </Box>
+
+      <Divider />
+      <Box>
+        <Typography variant="subtitle2">24/7 cloud broadcast</Typography>
+        <Typography variant="caption" color="text.secondary" component="div" sx={{ mb: 1 }}>
+          The server renders and streams the show in a headless browser, so you can close this tab. It survives disconnects, encoder restarts and server reboots, and recycles itself to keep memory flat.
+        </Typography>
+        {cloudLive ? (
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Chip color="error" label={`Cloud producer ${st.live.state}`} />
+            {st.live.reconnects ? <Chip variant="outlined" label={`${st.live.reconnects} auto-recoveries`} /> : null}
+          </Stack>
+        ) : (
+          <Button variant="contained" color="error" startIcon={<Icon name="cloud_upload" />} disabled={live || !hasDestinations} onClick={onGoCloud}>
+            Start 24/7 cloud stream
+          </Button>
+        )}
+        {!hasDestinations && (
+          <Typography variant="caption" color="text.secondary" component="div" sx={{ mt: 1 }}>
+            Add a destination in the Stream tab first.
+          </Typography>
+        )}
+      </Box>
+    </Stack>
+  );
+}
+
+const MIN_SCENE_S = 5;
+const MAX_SCENE_S = 600;
+const SCENE_PRESETS = [15, 30, 45, 60, 90, 120];
+
+/** How long each Auto Live scene stays on air: slider for quick picks, a box for exact seconds. */
+function SceneDuration({ seconds, onChange }: { seconds: number; onChange: (v: number) => void }) {
+  const [draft, setDraft] = useState(String(seconds));
+  const [slider, setSlider] = useState(seconds);
+  useEffect(() => {
+    setDraft(String(seconds));
+    setSlider(seconds);
+  }, [seconds]);
+  const n = Number(draft);
+  const valid = draft.trim() !== '' && Number.isInteger(n) && n >= MIN_SCENE_S && n <= MAX_SCENE_S;
+  const commit = () => {
+    if (valid && n !== seconds) onChange(n);
+    else if (!valid) setDraft(String(seconds));
+  };
+  const fmt = (v: number) => (v >= 60 && v % 60 === 0 ? `${v / 60} min` : v > 60 ? `${Math.floor(v / 60)} min ${v % 60}s` : `${v}s`);
+
+  return (
+    <Box>
+      <Stack direction="row" alignItems="center" spacing={1.5}>
+        <Typography variant="subtitle2" sx={{ flex: 1 }}>
+          Scene duration · {fmt(seconds)}
+        </Typography>
+        <TextField
+          size="small"
+          type="number"
+          value={draft}
+          error={!valid}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+          }}
+          slotProps={{
+            htmlInput: { min: MIN_SCENE_S, max: MAX_SCENE_S, step: 1, 'aria-label': 'Scene duration in seconds' },
+            input: { endAdornment: <InputAdornment position="end">sec</InputAdornment> },
+          }}
+          sx={{ width: 120 }}
+        />
+      </Stack>
+      <Slider
+        min={10}
+        max={180}
+        step={5}
+        value={Math.min(180, Math.max(10, slider))}
+        marks={[
+          { value: 15, label: '15s' },
+          { value: 45, label: '45s' },
+          { value: 90, label: '90s' },
+          { value: 180, label: '3m' },
+        ]}
+        onChange={(_, v) => setSlider(v as number)}
+        onChangeCommitted={(_, v) => onChange(v as number)}
+      />
+      <Stack direction="row" spacing={0.75} sx={{ mb: 0.75, flexWrap: 'wrap', rowGap: 0.75 }}>
+        {SCENE_PRESETS.map((v) => (
+          <Chip key={v} size="small" label={fmt(v)} color={v === seconds ? 'primary' : 'default'} variant={v === seconds ? 'filled' : 'outlined'} onClick={() => onChange(v)} />
+        ))}
+      </Stack>
+      <Typography variant="caption" color="text.secondary">
+        Each scene stays on air this long ({MIN_SCENE_S}–{MAX_SCENE_S} seconds; type any value in the box). Wickets, boundaries and milestones still interrupt instantly.
+      </Typography>
+    </Box>
+  );
+}
