@@ -61,9 +61,13 @@ object BroadcastController {
     ) {
         val eng = ensureEngine(context)
         eng.start(destinations, quality, hasMicPermission, micEnabled)
+        // A failed start must not leave an "ON AIR" notification behind.
+        if (!eng.isRunning) return
         val intent = Intent(context, BroadcastForegroundService::class.java).apply {
             action = BroadcastForegroundService.ACTION_START
-            putExtra(BroadcastForegroundService.EXTRA_WITH_MIC, hasMicPermission && micEnabled)
+            // Based on permission, not the mute state, so unmuting mid-stream still works
+            // while the app is in the background.
+            putExtra(BroadcastForegroundService.EXTRA_WITH_MIC, hasMicPermission)
         }
         runCatching {
             ContextCompat.startForegroundService(context, intent)
@@ -115,12 +119,8 @@ class BroadcastForegroundService : Service() {
             startForeground(NOTIF_ID, notif)
         }
 
-        return START_STICKY
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        BroadcastController.ensureEngine(applicationContext).stop()
+        // A system restart has no destinations to resume, so it would only show a false ON AIR.
+        return START_NOT_STICKY
     }
 
     private fun ensureChannel() {

@@ -5,6 +5,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Bundle
 import android.view.Surface
 import com.cricstudio.app.compositor.BroadcastCanvasRenderer
 import com.cricstudio.app.model.BroadcastStatus
@@ -69,6 +70,9 @@ class BroadcastEngine(private val appContext: Context) {
     private val droppedFrameCounter = AtomicInteger(0)
     private val latestMicLevel = AtomicReference(0f)
 
+    val isRunning: Boolean
+        get() = running.get()
+
     fun updateSnapshot(snapshot: CompositorSnapshot) {
         latestSnapshot.set(snapshot)
     }
@@ -124,13 +128,14 @@ class BroadcastEngine(private val appContext: Context) {
             startAudioPipeline(hasMicPermission, micEnabled)
         } catch (e: Exception) {
             appendLog("Encoder initialization failed: ${e.message}")
+            // stop() resets the status to IDLE, so report the error after it.
+            stop()
             _telemetry.update {
                 it.copy(
                     status = BroadcastStatus.ERROR,
                     lastError = "Hardware encoder error: ${e.message ?: "unsupported format"}",
                 )
             }
-            stop()
             return
         }
 
@@ -153,9 +158,14 @@ class BroadcastEngine(private val appContext: Context) {
         audioPipeline?.stop()
         audioPipeline = null
 
+        // Both loops touch the codec and its surface, so they must exit before release.
         renderThread?.interrupt()
-        videoDrainThread?.interrupt()
+        runCatching { renderThread?.join(500) }
         runCatching { videoEncoder?.signalEndOfInputStream() }
+        videoDrainThread?.interrupt()
+        runCatching { videoDrainThread?.join(500) }
+        renderThread = null
+        videoDrainThread = null
         runCatching { videoEncoder?.stop() }
         runCatching { videoEncoder?.release() }
         runCatching { inputSurface?.release() }
@@ -351,6 +361,7 @@ class BroadcastEngine(private val appContext: Context) {
                 rawUrl = dest.url,
                 rawStreamKey = dest.streamKey,
                 onLog = { msg -> appendLog("[${dest.name}] $msg") },
+                onNeedKeyframe = ::requestKeyframe,
             )
             try {
                 publisher.connectAndPublish(
@@ -365,6 +376,9 @@ class BroadcastEngine(private val appContext: Context) {
                 // Push cached sequence headers immediately so server locks onto H.264/AAC
                 cachedAvcConfig?.let { publisher.sendVideoSequenceHeader(it) }
                 cachedAudioConfig?.let { publisher.sendAudioSequenceHeader(it) }
+                // Viewers cannot decode until a keyframe, so ask for one now instead of
+                // waiting for the next scheduled one.
+                requestKeyframe()
 
                 updateDestinationStatus(dest, BroadcastStatus.LIVE, "Streaming live")
                 while (running.get() && publisher.isConnected) {
@@ -380,9 +394,9 @@ class BroadcastEngine(private val appContext: Context) {
 
                 val msg = e.message ?: "Network error"
                 appendLog("[${dest.name}] Error: $msg")
-                val fatalKeyError = msg.contains("rejected", ignoreCase = true) ||
-                    msg.contains("BadName", ignoreCase = true) ||
-                    msg.contains("Stream key is required", ignoreCase = true)
+                val fatalKeyError = e is RtmpConfigException ||
+                    msg.contains("rejected", ignoreCase = true) ||
+                    msg.contains("BadName", ignoreCase = true)
 
                 if (fatalKeyError) {
                     updateDestinationStatus(dest, BroadcastStatus.ERROR, msg)
@@ -398,6 +412,14 @@ class BroadcastEngine(private val appContext: Context) {
                 publishers.remove(dest.id)
                 runCatching { publisher.close() }
             }
+        }
+    }
+
+    private fun requestKeyframe() {
+        runCatching {
+            videoEncoder?.setParameters(
+                Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) },
+            )
         }
     }
 
@@ -417,6 +439,7 @@ class BroadcastEngine(private val appContext: Context) {
                 publishers.forEach { (id, pub) ->
                     val kbps = ((pub.drainBytesSent() * 8.0) / (dtSec * 1000.0)).toInt()
                     totalKbps += kbps
+                    droppedFrameCounter.addAndGet(pub.drainDroppedFrames())
                     destMap[id]?.let { existing ->
                         destMap[id] = existing.copy(bitrateKbps = kbps)
                     }

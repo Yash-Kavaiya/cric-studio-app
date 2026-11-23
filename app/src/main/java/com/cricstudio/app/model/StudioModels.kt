@@ -202,7 +202,7 @@ enum class StreamPlatform(
 ) {
     YOUTUBE(
         "YouTube",
-        "rtmp://a.rtmp.youtube.com/live2",
+        "rtmps://a.rtmps.youtube.com/live2",
         0xFFFF0000,
         "YouTube Studio -> Go live -> Stream -> copy Stream key.",
     ),

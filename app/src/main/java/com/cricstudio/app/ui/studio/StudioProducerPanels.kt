@@ -7,6 +7,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
@@ -751,7 +753,13 @@ fun StreamAndChatTab(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("YouTube & RTMP Destinations", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Stream Destinations",
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
                         OutlinedButton(
                             onClick = onAddDestinationClick,
                             modifier = Modifier.testTag("add_destination_button"),
@@ -763,7 +771,10 @@ fun StreamAndChatTab(
                     }
 
                     // Encoding Quality Selector
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
                         com.cricstudio.app.model.StreamQuality.entries.forEach { q ->
                             FilterChip(
                                 selected = telemetry.quality == q,
@@ -780,7 +791,7 @@ fun StreamAndChatTab(
                             shape = RoundedCornerShape(10.dp),
                         ) {
                             Text(
-                                "Tap Add (or Go Live) to paste your YouTube Live Stream Key and push real 720p30 H.264 + AAC video straight from this device.",
+                                "Tap Add (or Go live), choose a platform and paste its stream key to broadcast straight from this device.",
                                 style = MaterialTheme.typography.bodySmall,
                                 modifier = Modifier.padding(10.dp),
                             )
@@ -811,17 +822,31 @@ fun StreamAndChatTab(
                                                 .background(Color(d.platform.colorHex)),
                                         )
                                         Column(modifier = Modifier.weight(1f)) {
-                                            Text(d.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                                            Text(
+                                                d.name,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
                                             Text(
                                                 "${d.platform.label} · ${if (missingKey) "Key missing — tap Edit" else d.keyMasked}",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = if (missingKey) CricRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
                                             )
                                         }
+                                        Switch(checked = d.enabled, onCheckedChange = { onToggleDestination(d.id) })
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.End,
+                                    ) {
                                         TextButton(onClick = { onEditDestinationClick(d) }) {
                                             Text("Edit Key")
                                         }
-                                        Switch(checked = d.enabled, onCheckedChange = { onToggleDestination(d.id) })
                                         IconButton(onClick = { onDeleteDestination(d.id) }) {
                                             Icon(Icons.Rounded.Delete, contentDescription = "Delete destination", tint = CricRed)
                                         }
@@ -902,7 +927,7 @@ fun StreamAndChatTab(
                 Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Icon(Icons.Rounded.RecordVoiceOver, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Text("Live Commentary Cue (Caption + Stream Audio)", style = MaterialTheme.typography.titleMedium)
+                        Text("Live Commentary Cue", style = MaterialTheme.typography.titleMedium)
                     }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(

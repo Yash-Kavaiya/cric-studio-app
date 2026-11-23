@@ -9,23 +9,57 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
+import java.net.URISyntaxException
 import java.util.Random
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+
+/** The URL or key is wrong, so retrying the connection cannot succeed. */
+class RtmpConfigException(message: String) : IllegalArgumentException(message)
 
 /**
  * Pure-Kotlin RTMP 1.0 / RTMPS (TLS) live publisher compatible with YouTube Live,
  * Facebook Live, Twitch, X, and custom RTMP ingest servers.
+ *
+ * Media is queued and written on a dedicated thread per destination, so a slow platform
+ * drops its own frames instead of stalling the encoder and every other platform.
  */
 class RtmpPublisher(
     private val rawUrl: String,
     private val rawStreamKey: String,
     private val onLog: (String) -> Unit = {},
+    private val onNeedKeyframe: () -> Unit = {},
 ) {
+    private class OutFrame(
+        val csId: Int,
+        val timestampMs: Int,
+        val msgType: Int,
+        val streamId: Int,
+        val payload: ByteArray,
+        val isControl: Boolean,
+    )
+
+    private val sendQueue = LinkedBlockingQueue<OutFrame>()
+    private val queuedBytes = AtomicLong(0L)
+    private val droppedFrames = AtomicInteger(0)
+    private val timestampBase = AtomicInteger(-1)
+    private val closing = AtomicBoolean(false)
+    private var senderThread: Thread? = null
+    private var publishedKey: String = rawStreamKey.trim()
+    @Volatile private var writeStartedAtMs = 0L
+    @Volatile private var hasVideoHeader = false
+    @Volatile private var hasAudioHeader = false
+    @Volatile private var awaitingKeyframe = true
+
     private var socket: Socket? = null
     private var input: DataInputStream? = null
     private var output: DataOutputStream? = null
@@ -54,6 +88,9 @@ class RtmpPublisher(
 
     companion object {
         private const val CHUNK_SIZE_OUT = 4096
+        private const val MAX_QUEUED_BYTES = 3_000_000L
+        private const val WRITE_STALL_MS = 10_000L
+        private val POISON = OutFrame(0, 0, 0, 0, ByteArray(0), true)
         private const val CSID_PROTOCOL = 2
         private const val CSID_COMMAND = 3
         private const val CSID_AUDIO = 4
@@ -71,15 +108,28 @@ class RtmpPublisher(
         private const val MSG_COMMAND_AMF0 = 20
 
         fun parseEndpoint(rawUrl: String, rawKey: String): ParsedEndpoint {
-            val cleanedUrl = rawUrl.trim()
-            val cleanedKey = rawKey.trim()
-            val uri = URI(cleanedUrl)
+            // Copy/paste from platform dashboards often brings whitespace or line breaks.
+            var cleanedUrl = rawUrl.filterNot { it.isWhitespace() }
+            var cleanedKey = rawKey.filterNot { it.isWhitespace() }
+            // Some dashboards offer one combined "URL + key" value; accept it in the key field.
+            if (cleanedKey.startsWith("rtmp://", ignoreCase = true) ||
+                cleanedKey.startsWith("rtmps://", ignoreCase = true)
+            ) {
+                cleanedUrl = cleanedKey
+                cleanedKey = ""
+            }
+            if (!cleanedUrl.contains("://")) cleanedUrl = "rtmp://$cleanedUrl"
+            val uri = try {
+                URI(cleanedUrl)
+            } catch (_: URISyntaxException) {
+                throw RtmpConfigException("Invalid RTMP URL. Check the server URL and try again.")
+            }
             val scheme = (uri.scheme ?: "rtmp").lowercase()
-            require(scheme == "rtmp" || scheme == "rtmps") {
-                "URL must start with rtmp:// or rtmps://"
+            if (scheme != "rtmp" && scheme != "rtmps") {
+                throw RtmpConfigException("URL must start with rtmp:// or rtmps://")
             }
             val host = uri.host?.takeIf { it.isNotBlank() }
-                ?: throw IllegalArgumentException("Missing RTMP host in URL")
+                ?: throw RtmpConfigException("Missing RTMP host in URL")
             val defaultPort = if (scheme == "rtmps") 443 else 1935
             val port = if (uri.port > 0) uri.port else defaultPort
 
@@ -87,15 +137,21 @@ class RtmpPublisher(
             val app: String
             val finalKey: String
             if (cleanedKey.isNotEmpty()) {
-                app = rawPath.ifEmpty { "live2" }
+                // Tolerate a URL that already ends with the same key.
+                app = rawPath.removeSuffix("/$cleanedKey").ifEmpty {
+                    if (host.contains("youtube", ignoreCase = true)) "live2"
+                    else throw RtmpConfigException("RTMP URL is missing its path, for example /live or /app")
+                }
                 finalKey = cleanedKey
             } else {
                 val slash = rawPath.lastIndexOf('/')
                 if (slash > 0) {
                     app = rawPath.substring(0, slash)
-                    finalKey = rawPath.substring(slash + 1)
+                    // Facebook keys carry required parameters after '?'.
+                    val query = uri.rawQuery?.let { "?$it" }.orEmpty()
+                    finalKey = rawPath.substring(slash + 1) + query
                 } else {
-                    throw IllegalArgumentException("Stream key is required")
+                    throw RtmpConfigException("Stream key is required")
                 }
             }
             val portSuffix = if (port == defaultPort) "" else ":$port"
@@ -109,19 +165,30 @@ class RtmpPublisher(
 
     fun drainBytesSent(): Long = bytesSent.getAndSet(0L)
 
+    fun drainDroppedFrames(): Int = droppedFrames.getAndSet(0)
+
     fun connectAndPublish(width: Int, height: Int, videoBitrateKbps: Int, fps: Int) {
         val ep = parseEndpoint(rawUrl, rawStreamKey)
+        publishedKey = ep.streamKey
         onLog("Connecting to ${ep.host}:${ep.port}/${ep.app}...")
 
         val rawSocket = Socket()
+        socket = rawSocket
         rawSocket.tcpNoDelay = true
         rawSocket.soTimeout = 15_000
         rawSocket.connect(InetSocketAddress(ep.host, ep.port), 10_000)
 
         val activeSocket: Socket = if (ep.scheme == "rtmps") {
             val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            factory.createSocket(rawSocket, ep.host, ep.port, true).apply {
+            (factory.createSocket(rawSocket, ep.host, ep.port, true) as SSLSocket).apply {
                 soTimeout = 15_000
+                startHandshake()
+                // SSLSocket does not check the hostname itself; the stream key must only
+                // ever be sent to the server named in the URL.
+                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(ep.host, session)) {
+                    close()
+                    throw SSLPeerUnverifiedException("TLS certificate does not match ${ep.host}")
+                }
             }
         } else {
             rawSocket
@@ -205,6 +272,7 @@ class RtmpPublisher(
         )
 
         activeSocket.soTimeout = 0
+        startSenderLoop()
         connected.set(true)
         onLog("Publishing live stream to ${ep.host}")
     }
@@ -218,7 +286,8 @@ class RtmpPublisher(
         payload[3] = 0x00.toByte()
         payload[4] = 0x00.toByte()
         System.arraycopy(avcConfigRecord, 0, payload, 5, avcConfigRecord.size)
-        sendMessage(CSID_VIDEO, 0, MSG_VIDEO, publishStreamId, payload)
+        enqueue(OutFrame(CSID_VIDEO, 0, MSG_VIDEO, publishStreamId, payload, isControl = true))
+        hasVideoHeader = true
     }
 
     fun sendVideoFrame(avccData: ByteArray, isKeyFrame: Boolean, timestampMs: Int) {
@@ -230,7 +299,7 @@ class RtmpPublisher(
         payload[3] = 0x00.toByte()
         payload[4] = 0x00.toByte()
         System.arraycopy(avccData, 0, payload, 5, avccData.size)
-        sendMessage(CSID_VIDEO, timestampMs.coerceAtLeast(0), MSG_VIDEO, publishStreamId, payload)
+        enqueueVideo(payload, isKeyFrame, timestampMs.coerceAtLeast(0))
     }
 
     fun sendAudioSequenceHeader(audioSpecificConfig: ByteArray) {
@@ -239,7 +308,8 @@ class RtmpPublisher(
         payload[0] = 0xAF.toByte() // AAC (10) | 44kHz (3) | 16-bit (1) | Stereo (1)
         payload[1] = 0x00.toByte() // AAC sequence header
         System.arraycopy(audioSpecificConfig, 0, payload, 2, audioSpecificConfig.size)
-        sendMessage(CSID_AUDIO, 0, MSG_AUDIO, publishStreamId, payload)
+        enqueue(OutFrame(CSID_AUDIO, 0, MSG_AUDIO, publishStreamId, payload, isControl = true))
+        hasAudioHeader = true
     }
 
     fun sendAudioFrame(rawAac: ByteArray, timestampMs: Int) {
@@ -248,21 +318,107 @@ class RtmpPublisher(
         payload[0] = 0xAF.toByte()
         payload[1] = 0x01.toByte() // AAC raw
         System.arraycopy(rawAac, 0, payload, 2, rawAac.size)
-        sendMessage(CSID_AUDIO, timestampMs.coerceAtLeast(0), MSG_AUDIO, publishStreamId, payload)
+        // Streams must open on a video keyframe, so hold audio until the timeline starts.
+        val base = timestampBase.get()
+        if (!hasAudioHeader || base < 0) return
+        val relativeTs = (timestampMs.coerceAtLeast(0) - base).coerceAtLeast(0)
+        enqueue(OutFrame(CSID_AUDIO, relativeTs, MSG_AUDIO, publishStreamId, payload, isControl = false))
+    }
+
+    private fun enqueueVideo(payload: ByteArray, isKeyFrame: Boolean, timestampMs: Int) {
+        if (!hasVideoHeader) return
+        if (queuedBytes.get() > MAX_QUEUED_BYTES && !awaitingKeyframe) {
+            dropQueuedVideo()
+            awaitingKeyframe = true
+            onNeedKeyframe()
+        }
+        if (awaitingKeyframe) {
+            if (!isKeyFrame) {
+                droppedFrames.incrementAndGet()
+                return
+            }
+            awaitingKeyframe = false
+        }
+        // Each connection gets its own timeline, so a reconnect starts again from zero.
+        timestampBase.compareAndSet(-1, timestampMs)
+        val relativeTs = (timestampMs - timestampBase.get()).coerceAtLeast(0)
+        enqueue(OutFrame(CSID_VIDEO, relativeTs, MSG_VIDEO, publishStreamId, payload, isControl = false))
+    }
+
+    private fun dropQueuedVideo() {
+        val iterator = sendQueue.iterator()
+        while (iterator.hasNext()) {
+            val frame = iterator.next()
+            if (frame.msgType == MSG_VIDEO && !frame.isControl) {
+                iterator.remove()
+                queuedBytes.addAndGet(-frame.payload.size.toLong())
+                droppedFrames.incrementAndGet()
+            }
+        }
+    }
+
+    private fun enqueue(frame: OutFrame) {
+        val startedAt = writeStartedAtMs
+        if (startedAt != 0L &&
+            System.currentTimeMillis() - startedAt > WRITE_STALL_MS &&
+            connected.compareAndSet(true, false)
+        ) {
+            // A blocked socket write has no timeout; closing the socket is what releases it.
+            onLog("Network stalled, reconnecting")
+            runCatching { socket?.close() }
+            return
+        }
+        queuedBytes.addAndGet(frame.payload.size.toLong())
+        sendQueue.offer(frame)
+    }
+
+    private fun startSenderLoop() {
+        senderThread = Thread({
+            try {
+                while (!closed.get()) {
+                    val frame = sendQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                    if (frame === POISON) break
+                    queuedBytes.addAndGet(-frame.payload.size.toLong())
+                    writeStartedAtMs = System.currentTimeMillis()
+                    sendMessage(frame.csId, frame.timestampMs, frame.msgType, frame.streamId, frame.payload)
+                    writeStartedAtMs = 0L
+                }
+            } catch (_: InterruptedException) {
+                // Shutting down.
+            } catch (e: Exception) {
+                if (!closing.get()) {
+                    onLog("Connection lost: ${e.message ?: "write failed"}")
+                    connected.set(false)
+                }
+            }
+        }, "CricStudio-RtmpSender").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        if (!closing.compareAndSet(false, true)) return
         connected.set(false)
-        runCatching {
-            if (socket?.isConnected == true && socket?.isClosed == false) {
-                sendCommand(CSID_COMMAND, 0, Amf0Codec.encodeValues("FCUnpublish", 0.0, null, rawStreamKey))
-                sendCommand(CSID_COMMAND, 0, Amf0Codec.encodeValues("deleteStream", 0.0, null, publishStreamId.toDouble()))
-            }
+        sendQueue.clear()
+        queuedBytes.set(0L)
+        val sender = senderThread
+        if (sender != null && sender.isAlive) {
+            // Say goodbye through the writer thread, but never wait long on a dead network.
+            sendQueue.offer(
+                OutFrame(CSID_COMMAND, 0, MSG_COMMAND_AMF0, 0, Amf0Codec.encodeValues("FCUnpublish", 0.0, null, publishedKey), true),
+            )
+            sendQueue.offer(
+                OutFrame(CSID_COMMAND, 0, MSG_COMMAND_AMF0, 0, Amf0Codec.encodeValues("deleteStream", 0.0, null, publishStreamId.toDouble()), true),
+            )
+            sendQueue.offer(POISON)
+            runCatching { sender.join(400) }
         }
-        runCatching { input?.close() }
-        runCatching { output?.close() }
+        closed.set(true)
+        // Closing the socket first releases any write that is still blocked.
         runCatching { socket?.close() }
+        runCatching { input?.close() }
+        sender?.interrupt()
         readerThread?.interrupt()
         pendingTx.values.forEach { it.cancel(true) }
         pendingTx.clear()
@@ -382,6 +538,7 @@ class RtmpPublisher(
         var msgLength: Int = 0,
         var msgType: Int = 0,
         var streamId: Int = 0,
+        var hasExtendedTimestamp: Boolean = false,
         var buffer: ByteArrayOutputStream = ByteArrayOutputStream(),
     )
 
@@ -404,22 +561,26 @@ class RtmpPublisher(
                             st.msgLength = readUint24(inp)
                             st.msgType = inp.readUnsignedByte()
                             st.streamId = readIntLE(inp)
-                            st.timestamp = if (ts == 0xFFFFFF) inp.readInt() else ts
+                            st.hasExtendedTimestamp = ts == 0xFFFFFF
+                            st.timestamp = if (st.hasExtendedTimestamp) inp.readInt() else ts
                             st.buffer = ByteArrayOutputStream(st.msgLength.coerceAtLeast(16))
                         }
                         1 -> {
                             val delta = readUint24(inp)
                             st.msgLength = readUint24(inp)
                             st.msgType = inp.readUnsignedByte()
-                            st.timestamp += if (delta == 0xFFFFFF) inp.readInt() else delta
+                            st.hasExtendedTimestamp = delta == 0xFFFFFF
+                            st.timestamp += if (st.hasExtendedTimestamp) inp.readInt() else delta
                             st.buffer = ByteArrayOutputStream(st.msgLength.coerceAtLeast(16))
                         }
                         2 -> {
                             val delta = readUint24(inp)
-                            st.timestamp += if (delta == 0xFFFFFF) inp.readInt() else delta
+                            st.hasExtendedTimestamp = delta == 0xFFFFFF
+                            st.timestamp += if (st.hasExtendedTimestamp) inp.readInt() else delta
                         }
                         3 -> {
-                            // Continuation chunk; no header fields
+                            // Continuation chunks repeat the extended timestamp when one is in use.
+                            if (st.hasExtendedTimestamp) inp.readInt()
                         }
                     }
 
@@ -498,9 +659,11 @@ class RtmpPublisher(
                                 code.contains("Rejected", ignoreCase = true) ||
                                 code.contains("Failed", ignoreCase = true) ||
                                 code.contains("Error", ignoreCase = true) -> {
-                                publishStartFuture.complete(
+                                val duringPublish = publishStartFuture.complete(
                                     Result.failure(IOException("Stream key rejected ($code): $desc")),
                                 )
+                                // A failure after going live ends this connection too.
+                                if (!duringPublish) connected.set(false)
                             }
                         }
                     }

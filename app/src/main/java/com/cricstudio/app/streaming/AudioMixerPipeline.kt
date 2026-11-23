@@ -108,15 +108,19 @@ class AudioMixerPipeline(
     }
 
     fun stop() {
-        if (!running.compareAndSet(false, false)) return
+        if (!running.compareAndSet(true, false)) return
         ttsQueue.clear()
-        currentTtsChunk = null
-        ttsOffset = 0
+        // Unblock a pending AudioRecord.read, then wait for both loops before releasing
+        // the native objects they use.
         runCatching { audioRecord?.stop() }
-        runCatching { audioRecord?.release() }
-        audioRecord = null
         mixThread?.interrupt()
         drainThread?.interrupt()
+        runCatching { mixThread?.join(500) }
+        runCatching { drainThread?.join(500) }
+        currentTtsChunk = null
+        ttsOffset = 0
+        runCatching { audioRecord?.release() }
+        audioRecord = null
         runCatching { encoder?.stop() }
         runCatching { encoder?.release() }
         encoder = null

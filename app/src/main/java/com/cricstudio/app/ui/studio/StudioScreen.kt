@@ -7,6 +7,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -47,9 +50,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -68,6 +71,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
@@ -89,10 +93,10 @@ import com.cricstudio.app.ui.theme.CricRed
 
 private enum class ProducerTab(val label: String, val icon: ImageVector) {
     SCENES("Scenes", Icons.Rounded.GridView),
-    AUTO("Auto & Events", Icons.Rounded.AutoAwesome),
+    AUTO("Auto", Icons.Rounded.AutoAwesome),
     MATCH("Match", Icons.Rounded.SportsCricket),
     BRAND("Brand", Icons.Rounded.Palette),
-    STREAM("Stream & Chat", Icons.Rounded.Cast),
+    STREAM("Stream", Icons.Rounded.Cast),
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -225,7 +229,7 @@ fun StudioScreen(
                         },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (studio.isLive) CricRed else MaterialTheme.colorScheme.primary,
-                            contentColor = Color.White,
+                            contentColor = if (studio.isLive) Color.White else MaterialTheme.colorScheme.onPrimary,
                         ),
                         shape = RoundedCornerShape(10.dp),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
@@ -239,7 +243,11 @@ fun StudioScreen(
                             modifier = Modifier.size(16.dp),
                         )
                         Spacer(Modifier.width(4.dp))
-                        Text(stringResource(if (studio.isLive) R.string.end_broadcast else R.string.go_live))
+                        Text(
+                            stringResource(if (studio.isLive) R.string.end_broadcast else R.string.go_live),
+                            maxLines = 1,
+                            softWrap = false,
+                        )
                     }
                 },
             )
@@ -251,14 +259,22 @@ fun StudioScreen(
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background),
         ) {
-            val isWide = maxWidth >= 760.dp
+            // Landscape phones are short, so they always get the side-by-side layout.
+            val isWide = maxWidth >= 760.dp || maxWidth > maxHeight
+            // In portrait, cap the 16:9 preview so the controls below always have room.
+            val portraitPreviewMaxWidth = maxHeight * 0.36f * (16f / 9f)
+            // In landscape, leave height for the status strip and director dock under the preview.
+            val widePreviewMaxWidth = maxOf(maxHeight - 150.dp, 120.dp) * (16f / 9f)
+            val showDirectorDock = isWide || maxHeight >= 620.dp
 
             val monitorColumn: @Composable (Modifier) -> Unit = { colModifier ->
                 Column(
                     modifier = colModifier,
                     verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     BroadcastStageCanvas(
+                        modifier = Modifier.widthIn(max = if (isWide) widePreviewMaxWidth else portraitPreviewMaxWidth),
                         studio = studio,
                         match = uiState.matchDetail,
                         allMatches = uiState.matches,
@@ -273,29 +289,31 @@ fun StudioScreen(
                         onToggleMic = onToggleMic,
                         onRetryStream = { launchWithPermissions { micOk -> onStartBroadcast(micOk) } },
                     )
-                    QuickDirectorDock(
-                        studio = studio,
-                        demoAutoPlay = uiState.demoAutoPlay,
-                        onSelectScene = onSelectScene,
-                        onSimulateEvent = onSimulateEvent,
-                        onToggleDemoAutoPlay = onToggleDemoAutoPlay,
-                        onStepDemo = onStepDemo,
-                    )
+                    if (showDirectorDock) {
+                        QuickDirectorDock(
+                            studio = studio,
+                            demoAutoPlay = uiState.demoAutoPlay,
+                            onSelectScene = onSelectScene,
+                            onSimulateEvent = onSimulateEvent,
+                            onToggleDemoAutoPlay = onToggleDemoAutoPlay,
+                            onStepDemo = onStepDemo,
+                        )
+                    }
                 }
             }
 
             val producerDeck: @Composable (Modifier) -> Unit = { deckModifier ->
                 Column(modifier = deckModifier) {
-                    ScrollableTabRow(
+                    // Fixed tabs: all five, including Stream, stay visible on any phone.
+                    TabRow(
                         selectedTabIndex = selectedTab.ordinal,
-                        edgePadding = 12.dp,
                         containerColor = MaterialTheme.colorScheme.surface,
                     ) {
                         ProducerTab.entries.forEach { tab ->
                             Tab(
                                 selected = selectedTab == tab,
                                 onClick = { selectedTab = tab },
-                                text = { Text(tab.label) },
+                                text = { Text(tab.label, fontSize = 12.sp, maxLines = 1, softWrap = false) },
                                 icon = { Icon(tab.icon, contentDescription = null, modifier = Modifier.size(18.dp)) },
                                 modifier = Modifier.testTag("studio_tab_${tab.name.lowercase()}"),
                             )
@@ -355,6 +373,7 @@ fun StudioScreen(
                         Modifier
                             .weight(1.15f)
                             .fillMaxHeight()
+                            .verticalScroll(rememberScrollState())
                             .padding(14.dp),
                     )
                     producerDeck(
@@ -427,7 +446,10 @@ fun StudioScreen(
             onDismissRequest = { showQuickGoLiveDialog = false },
             title = { Text(stringResource(R.string.quick_go_live_title)) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(StreamPlatform.entries) { p ->
                             FilterChip(
@@ -451,19 +473,19 @@ fun StudioScreen(
                     OutlinedTextField(
                         value = streamKey,
                         onValueChange = { streamKey = it },
-                        label = { Text("YouTube / RTMP Stream Key") },
-                        placeholder = { Text("xxxx-xxxx-xxxx-xxxx-xxxx") },
+                        label = { Text("${platform.label} Stream Key") },
+                        placeholder = { Text("Paste your stream key") },
                         singleLine = true,
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("quick_stream_key_input"),
                     )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StreamQuality.entries.forEach { q ->
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(StreamQuality.entries) { q ->
                             FilterChip(
                                 selected = quality == q,
                                 onClick = { quality = q },
-                                label = { Text(q.label) },
+                                label = { Text(q.label, maxLines = 1) },
                             )
                         }
                     }
@@ -570,7 +592,10 @@ fun StudioScreen(
             onDismissRequest = { showAddDestDialog = false },
             title = { Text("Add Stream Destination") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(StreamPlatform.entries) { p ->
                             FilterChip(

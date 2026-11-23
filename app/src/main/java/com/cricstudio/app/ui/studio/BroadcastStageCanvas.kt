@@ -143,8 +143,9 @@ fun BroadcastStageCanvas(
         // Translucent monitor utility actions (overlay dismiss + fullscreen)
         Row(
             modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(top = 26.dp, end = 6.dp),
+                // Bottom corner, clear of the score and run-rate panels and above the ticker.
+                .align(Alignment.BottomEnd)
+                .padding(bottom = 26.dp, end = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             if (studio.overlay != null) {
@@ -261,6 +262,8 @@ fun StreamTelemetryStrip(
                     fontWeight = FontWeight.Bold,
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
             } else {
@@ -268,6 +271,8 @@ fun StreamTelemetryStrip(
                     text = "${telemetry.quality.label} · Ready to stream",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -428,7 +433,7 @@ fun QuickDirectorDock(
             ) {
                 Text(
                     text = sc.shortName,
-                    color = if (active) Color.White else MaterialTheme.colorScheme.onSurface,
+                    color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
                     fontSize = 11.sp,
                     fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
